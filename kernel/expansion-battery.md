@@ -2,26 +2,26 @@
 
 Each case is a workflow expanded into the kernel's blocks and events on paper. A case passes when it uses only what the kernel spec defines. The battery is also the record of why fields exist: if a case can no longer be expressed, something it needs was removed.
 
-Cases the MVP builds have test cases as data in `test-cases/` (definition, inputs, exact events expected). The others stay on paper, with small replay-only cases for the insurance fields.
+Cases the MVP builds have a definition and test cases as data under `workflows/` (inputs and the exact events expected). The others stay on paper, with small replay-only cases for the insurance fields.
 
 | Case | Workflow | Built in the MVP | Status | Test data |
 |---|---|---|---|---|
-| C1 | Change request | Yes | Passes on spec v2.7 | `test-cases/c1-change-request.yaml` (T1 to T8) |
+| C1 | Change request | Yes | Passes on spec v2.9 | `workflows/change-request/` (T1 to T12) |
 | C2 | Metric change control | No | Expressible with reserved features; the revise-and-reapprove loop is a known weak spot | Paper |
-| C3 | Checklist item ticked, un-ticked, re-ticked | No | Representation only | `test-cases/replay-only.yaml` R2 |
+| C3 | Checklist item ticked, un-ticked, re-ticked | No | Representation only | `replay-only.yaml` R2 |
 | P1 | Start without waiting, join later | No | Passes with child requests | Paper; R3 covers the parent field |
 | P2 | Work that survives a send-back | No | Passes with child requests | Paper; R3 |
 | P3 | Fan-out where each leg runs several steps | No | Passes with child requests | Paper |
-| P4 | Two stage paths active at once | No | Representation only | `test-cases/replay-only.yaml` R1 |
-| I1 | Ten repeated in-stage actions | No | 3 of 10 clean with repeatable waits; the rest need an undesigned layer; history is safe for all | Paper; reports in `instage-test/` |
+| P4 | Two stage paths active at once | No | Representation only | `replay-only.yaml` R1 |
+| I1 | Ten repeated in-stage actions | No | 3 of 10 clean with repeatable waits; the rest need an undesigned layer; history is safe for all | Paper; reports in `research/instage-test/` |
 
 ## C1. Change request
 
-The definition and the happy-path trace are in section 9 of `kernel-spec.md`. The edge cases are T2 to T8 in `test-cases/c1-change-request.yaml`.
+The definition is `workflows/change-request/definition.md`; its cases are T1 to T12 in `workflows/change-request/test-cases.yaml`. It has three paths: all domains approve, the primary domain alone approves, and no approval.
 
 Passes if: every trace uses only the events in section 5 of the spec.
 
-Needs: `foreach` on person waits; the guarded wait-status record; `CallResultLate`; admin skip of a single wait; stage `requires` with supply-or-waive on a jump; notification rules.
+Needs: `foreach` on person waits; the guarded wait-status record; `CallResultLate`; admin skip of a single wait; stage `requires` with supply-or-waive on a jump; notification rules; a stage with no waits; an admin jump to the current stage.
 
 ## C2. Metric change control
 
@@ -66,7 +66,7 @@ Needs: `seq` in the wait ID.
 
 ## I1. Repeated in-stage actions
 
-Ten patterns, each expanded under three models: data-driven (an action is a validated write), event-driven (named events with handlers), and the hybrid in the spec (a repeatable wait with its own Set). A fourth agent tried to show that the history favours one model. Reports: `instage-test/`.
+Ten patterns, each expanded under three models: data-driven (an action is a validated write), event-driven (named events with handlers), and the hybrid in the spec (a repeatable wait with its own Set). A fourth agent tried to show that the history favours one model. Reports: `research/instage-test/`.
 
 1. Checkbox: tick, un-tick, re-tick; a gate needs all required items.
 2. Field edit, several times; the latest value is used.

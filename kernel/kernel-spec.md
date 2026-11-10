@@ -1,24 +1,22 @@
-# Workflow engine kernel: spec v2.7
+# Workflow engine kernel: spec v2.9
 
-Status: proposal. The design doc summarises it; this file is the reference.
+Status: proposal. This file is the reference for the engine. It does not describe any workflow or composite; those live in `composites/` and `workflows/` and refer to this file, never the reverse.
 
 The spec covers every known use case; only the MVP is built. Three tiers:
 - **Permanent layer** (event shapes, IDs, insurance fields): specified in full now. Section 5.
-- **MVP behaviour:** specified in full. Sections 2 to 4, 6, 7 and 9. Its tests are in `test-cases/`.
+- **MVP behaviour:** specified in full. Sections 2 to 7.
 - **Later features:** one short reserved rule each, in section 8, plus a paper case in `expansion-battery.md`. Full spec when built.
 
 The spec stays terse. The reason an insurance field exists is the battery case it points to: if that case can no longer be expressed, the field was removed.
 
 ## 1. Scope
 
-The change-request workflow is the refactor of the existing Change Management product: same behaviour, with the workflow part made configurable. It is the only workflow in the MVP.
-
 | Part | MVP | Reserved (slots held, not built) |
 |---|---|---|
 | Stage | Root stage plus one level of child stages | Deeper nesting is not planned: a multi-step task inside a stage is a child request. History can already describe nesting (`parentActivation`). |
 | Transition | Yes | |
 | Wait: person | Yes, with a single `may` rule | Act-time gates; repeatable waits |
-| Wait: call | Yes (directory read) | |
+| Wait: call | Yes | |
 | Wait: timer | No | Section 8 |
 | Wait: child | No | Section 8 |
 | `foreach` | Yes, on person waits | On other wait kinds |
@@ -32,7 +30,7 @@ The event vocabulary is provisional until a second use case has been built again
 
 **Definition.** `{start, root, notifications}`. `start` is `{schema, set}`: the input is validated against `schema` and `set` writes it into data. `root.initial` names the child stage a request starts in.
 
-**Stage.** A named scope. The root stage is always active; exactly one child stage is active. Each entry creates an *activation* with a new ID. A stage declares waits, transitions, an optional display `status`, and optional `requires` (data paths that must exist on entry). Entering a stage opens all its waits. Leaving it cancels the ones still open. A `final` stage closes the request. Replay state and the request table store the active stages as a set; only `decide` enforces "exactly one active child" (battery P4).
+**Stage.** A named scope. The root stage is always active; exactly one child stage is active. Each entry creates an *activation* with a new ID. A stage declares waits, transitions, an optional display `status`, and optional `requires` (data paths that must exist on entry). Entering a stage opens all its waits. Leaving it cancels the ones still open. A stage may have no waits: its transitions are evaluated in the turn that enters it, so it works as a routing step. A `final` stage closes the request. Replay state and the request table store the active stages as a set; only `decide` enforces "exactly one active child" (battery P4).
 
 **Transition.** `{id, when: CEL, set: {path: CEL}, to: stage}` declared on a stage.
 - Level-triggered: `when` is evaluated over recorded state at the end of every turn.
@@ -46,7 +44,7 @@ The event vocabulary is provisional until a second use case has been built again
 - `seq` is an ordinal per `(element, activation, key)`, whatever caused the new instance. The highest `seq` is the current instance, for every wait kind, in `evolve` and in CEL. The MVP's `decide` only ever writes 1, but no code may assume `seq` is 1, that one instance exists, or that a predecessor completed (battery C3, I1). A repeated write call's idempotency key includes `seq`.
 - In CEL every wait in scope is always readable as `waits.<element ID>` (for example `waits.primary.decision`) = `{status, outcome, by}`; `outcome` is `""` unless completed; `by` is who completed it, `{type, id}`. `waits.<name>.data` may be read only under a guard on that wait's outcome; the publish check enforces it.
 - *Person:* `assignees` (user and group references, recorded at open, not expanded), `may` (optional CEL, default true; reads `data`, `request`, `actor`, waits in scope), `outcomes` (enum, each with a data schema), `role: obligation | option`. At act time the engine looks up the actor's memberships, checks `assignees` and `may`, validates data, and records the lookup as evidence. A refused attempt changes nothing and goes to an attempts log outside history.
-- *Call:* `connector`, `op`, `args`, `effect: read | write`, optional `idempotencyKey`. Outcome `ok` or `failed`. Default idempotency key: reads are per activation (re-entry reads again); writes are per request. The pending call is written in the same transaction as the event that opened it; a dispatcher delivers at least once, and a reconciler re-queues anything open with no delivery in flight.
+- *Call:* `connector`, `op`, `args`, `effect: read | write`, optional `idempotencyKey`, optional `onFailure: fault | outcome` (default `fault`). A result is `ok` or `failed`. By default a failed call is an error, not a case the workflow handles: the request faults (section 3). With `onFailure: outcome`, `failed` is an ordinary outcome that conditions may read and the stage's transitions must cover. Default idempotency key: reads are per activation (re-entry reads again); writes are per request. The pending call is written in the same transaction as the event that opened it; a dispatcher delivers at least once, and a reconciler re-queues anything open with no delivery in flight.
 - *Connector obligations:* honour the key. For a key that already succeeded, return that result and do nothing else (look up by key before creating if the external system has no idempotency support). For a key that failed, try again. Never report a timeout or "don't know" as `failed`; keep the call pending. An author who wants a retry with different arguments sets an explicit key.
 - *`foreach`:* `foreach: <CEL list>` on a person wait opens one wait per item when the stage is entered. The list is evaluated once and recorded; it is not re-evaluated if data changes later. Items must be distinct (a duplicate is a fault). `item` is available in the wait's other expressions and becomes the wait's `key`. In CEL the waits read as a list: `waits.<name>.all(w, ...)`, `.exists(w, ...)`. An empty list opens nothing, and `all` over it is true.
 
@@ -54,7 +52,7 @@ The event vocabulary is provisional until a second use case has been built again
 
 **CEL context.** `data`; `request` = `{id, by, at}` (`by` is the starter, `{type, id}`); `actor` = `{type, id}` (in `may` only); `waits` for the current activations of the root and the active child. Earlier activations are invisible. There is no clock. Anything that must persist goes through Set.
 
-Waits on the root stage are open for the whole life of the request and are cancelled when it closes. The change request does not use them.
+Waits on the root stage are open for the whole life of the request and are cancelled when it closes.
 
 ## 3. Turns
 
@@ -69,14 +67,14 @@ Event order within a turn: the input; then for each firing `TransitionFired`, `D
 
 `evolve(state, event)` is the only code replay uses. It never evaluates CEL and never reads the definition.
 
-**Faults.** If a CEL evaluation errors, or a turn exceeds 50 firings, the turn's decisions are rolled back, the input event is kept, and `Faulted{kind: error, element, error}` is appended. A faulted request still accepts and records inputs but runs no `decide` until an admin turn clears the fault; then `decide` runs for the kept inputs in order. A CEL error is never treated as false. Reading a waived `requires` path is a CEL error. A `stuck` fault is a flag for admins: it does not stop evaluation, and it is cleared by an admin turn or by the request closing.
+**Faults.** If a CEL evaluation errors, a turn exceeds 50 firings, or a call without `onFailure: outcome` returns `failed`, the turn's decisions are rolled back, the input event is kept, and `Faulted{kind: error, element, error}` is appended. For a failed call the input is its `WaitCompleted{outcome: failed}` and the element is the wait; the fault is raised once, when the result is accepted, and an admin retries by re-entering the stage. A faulted request still accepts and records inputs but runs no `decide` until an admin turn clears the fault; then `decide` runs for the kept inputs in order. A CEL error is never treated as false. Reading a waived `requires` path is a CEL error. A `stuck` fault is a flag for admins: it does not stop evaluation, and it is cleared by an admin turn or by the request closing.
 
 ## 4. Admin turns
 
 `Overridden {by, reason, breakGlassSession?, actions, waived}` is an input event. Its consequences are ordinary events in the same turn. All actions are applied first; `decide` and the stuck check run once, at the end of the turn. Actions:
 
 - **Skip one wait:** `WaitSkipped`. Conditions see `status: skipped`. A skip alone never decides anything: it does not satisfy `otherwise` or any outcome test. To move on, the admin also jumps, or the author writes an explicit path (`when waits.x.status == 'skipped'`).
-- **Jump to a stage:** open waits in the exited stage are skipped; the event records `from` and `to`. For each path in the target's `requires`, the admin supplies a value or lists it in `waived`.
+- **Jump to a stage:** open waits in the exited stage are skipped; the event records `from` and `to`. The target may be the stage the request is already in: that re-enters it (new activation, fresh waits, read calls made again). For each path in the target's `requires`, the admin supplies a value or lists it in `waived`.
 - **Set data:** `DataSet{source: admin}`.
 - **Disable a transition for this request.**
 - **Clear a fault.**
@@ -117,12 +115,12 @@ Envelope on every event: `requestId`, `seq`, `at` (the only clock), `turn`, `v` 
 - Every CEL expression type-checks against the data schema, wait outcomes and connector result types.
 - Wait reads are in scope; `.data` reads are guarded.
 - A data path is read only where it is set on every path to that point or listed in the stage's `requires`.
-- Outcomes are enums. Each stage's transitions cover every combination of its waits' outcomes, or the stage has an `otherwise`.
+- Outcomes are enums. Each stage's transitions cover every combination of its waits' outcomes, or the stage has an `otherwise`. A call's `failed` counts, and may be read, only with `onFailure: outcome`.
 - Every stage can reach a final stage.
 - Every cycle of transitions passes through a condition on a wait opened inside the cycle.
 - Warning: a write call in a stage that a root transition can interrupt.
 
-"Cannot get stuck" is not provable in general; the runtime stuck check is the backstop. Whether anybody is able to act on a person wait is not a kernel concern: the approval composite reads group membership, and a notification rule alerts on the result.
+"Cannot get stuck" is not provable in general; the runtime stuck check is the backstop. Whether anybody is able to act on a person wait is not a kernel concern; a composite can check it with a call and a notification rule.
 
 ## 7. Notification rules
 
@@ -144,7 +142,7 @@ notifications:
 Other contracts:
 - The published definition format and its CEL environment are a second long-lived contract: the engine must be able to run `decide` for a definition version for as long as a request on it is open.
 - Composites are expanded at publish; history never names one. A later migration finds the composite through the definition (history -> definition version -> element -> composite instance). Replay still never reads the definition. Three rules keep that lookup usable:
-  - An expanded element's ID is the composite instance ID plus a local name (`primary.decision`, `primary.members`), never positional. It stays the same across composite versions when the element means the same thing.
+  - An expanded element's ID is the composite instance ID plus a local name (`primary.decision`, `primary.members`), never positional. It stays the same across composite versions when the element means the same thing. Instance IDs are unique within a stage; an element's full ID, and the ID of any notification rule a composite emits, is prefixed with the stage (`Pending.primary.decision`).
   - The published definition records, for each composite instance: composite name, composite version, and the parameters used.
   - Any change to a composite's expansion needs a new composite version. In the MVP composites are code: a build test compares each expansion with a stored copy and fails if it changed without a version bump.
 - Action-item list = open person waits with `role: obligation` whose assignees name the viewer or a group they belong to now. Options show on the request page only.
@@ -183,70 +181,7 @@ Other contracts:
 - Transitions stay one-shot per stage entry.
 - Known limits: work on every occurrence, dismissing some approvals after an edit, a repeatable stage move, reassignment, adding to a `foreach` list, and question-and-answer as a real task. These need a completion that can open or replace waits and calls. That layer is not designed; it must be opt-in so it stays additive.
 
-## 9. The change request
-
-The request has one primary domain and zero or more other domains, from the form. Every domain's approvers must approve. The primary domain's approver must pick the eng lead in order to approve. The request only moves forward.
-
-```
-start: { schema: changeForm, set: { form: input } }
-root:
-  initial: Pending
-  stages:
-    Pending:
-      waits:
-        primary.members:  call { connector: directory, op: membersOf, effect: read,
-                                 args: { groups: [approverGroup[data.form.primaryDomain]] } }
-        primary.decision: person { assignees: [group: approverGroup[data.form.primaryDomain]],
-                                   may: actor != request.by, role: obligation,
-                                   outcomes: { approve: { engLead: user }, reject: { reason: string } } }
-        others.members:   call { connector: directory, op: membersOf, effect: read,
-                                 args: { groups: data.form.otherDomains.map(d, approverGroup[d]) } }
-        others.decision:  person { foreach: data.form.otherDomains,
-                                   assignees: [group: approverGroup[item]],
-                                   may: actor != request.by, role: obligation,
-                                   outcomes: { approve: {}, reject: { reason: string } } }
-      transitions:
-        t_reject: when waits.primary.decision.outcome == 'reject'
-                       || waits.others.decision.exists(w, w.outcome == 'reject')    ->  Rejected
-        t_accept: when waits.primary.decision.outcome == 'approve'
-                       && waits.others.decision.all(w, w.outcome == 'approve')
-                  set { engLead: waits.primary.decision.data.engLead }              ->  InDevelopment
-    InDevelopment:  requires: [engLead]
-      waits:  release.task: person { assignees: [user: data.engLead], role: obligation, outcomes: [released] }
-      transitions:  t_release: when waits.release.task.outcome == 'released'  ->  Released
-    Released: final     Rejected: final
-notifications:
-  - id: primary.noApprover
-    on:   WaitCompleted primary.members
-    when: outcome == 'failed' || data.groups.exists(g, !g.members.exists(m, m != request.by.id))
-    send: { template: alertAdmins, to: group: workflowAdmins }
-  - id: others.noApprover
-    on:   WaitCompleted others.members
-    when: (same as primary.noApprover)
-    send: { template: alertAdmins, to: group: workflowAdmins }
-  - id: n_task
-    on:   WaitOpened
-    when: kind == 'person' && role == 'obligation'
-    send: { template: newTask, to: assignees }
-```
-
-This is the published (expanded) form. It comes from three composite instances: `primary` and `others` (Approval) and `release` (Task). The composites themselves are described in the design doc, not here; the kernel only sees their expansion. Element IDs follow the rule in section 7. `others.members` is opened even when there are no other domains (an empty group list).
-
-No transition reads a `members` call. Its result is recorded so the notifier can alert admins when a domain has nobody able to approve; the request is submitted either way and waits.
-
-Happy path with one other domain (input first in each turn):
-
-1. `RequestStarted` · `DataSet` · `StageEntered root` · `StageEntered Pending` · `WaitOpened primary.members` · `WaitOpened primary.decision` · `WaitOpened others.members` · `WaitOpened others.decision[domainB]`
-2. `WaitCompleted primary.members ok`, then `WaitCompleted others.members ok` (one turn each)
-3. `WaitCompleted others.decision[domainB] approve`
-4. `WaitCompleted primary.decision approve {engLead}` · `TransitionFired t_accept` · `DataSet` · `StageExited Pending` · `StageEntered InDevelopment` · `WaitOpened release.task`
-5. `WaitCompleted release.task` · `TransitionFired t_release` · `StageExited InDevelopment` · `StageEntered Released` · `RequestClosed`
-
-The edge cases are the test cases in `test-cases/c1-change-request.yaml`.
-
-Assumptions to confirm against the existing product: approvals for all domains run in parallel; one rejection rejects the whole request; a person in two domains' groups may approve for both.
-
-## 10. Not addressed
+## 9. Not addressed
 
 - Erasing personal data from history (set aside for now).
 - Date-triggered starts and scheduling (set aside; possibly a separate obligations feature later).

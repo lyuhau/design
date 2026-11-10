@@ -1,0 +1,423 @@
+# Test cases for the change request, against kernel/kernel-spec.md v2.9.
+#
+# These are data, not code. Each case is: a list of inputs, and for each input either the exact
+# events the engine must append (in order) or a refusal. No harness exists yet.
+#
+# Conventions
+# - The definition under test is definition.md, next to this file.
+# - Element IDs are <composite instance>.<local name>: primary.decision, others.members, release.task.
+# - Activation IDs are symbolic: a1 is the root, a2 is Route, a3 the next stage entered, and so on.
+# - A wait is written <stage>.<element>[<foreach key>]@<activation>. seq is 1 everywhere and omitted.
+# - Envelope fields (requestId, seq, at, turn, v, engineBuild) are not listed. `turn` of every
+#   event in a block is the seq of that block's first event.
+# - Payload fields not listed are not asserted.
+# - `by: rita` is short for { type: user, id: rita }; `by: "connector:directory"` for
+#   { type: connector, id: directory }; `by: "system:engine"` for { type: system, id: engine }.
+# - `patch: { engLead: lee }` is short for [ { op: set, path: engLead, value: lee } ].
+# - `notify` lists the notification rules the notifier must match for that turn. It is checked
+#   against the notifier, not the engine: notifications are not history events.
+#
+# Paths are chosen by the primary domain. T1 to T7b: primary A, all domains approve (PendingAll).
+# T8 to T10: any other primary, the primary alone decides (PendingPrimary). T11 and T12: primary D, no approval (AssignLead).
+
+fixtures:
+  constants:
+    approverGroup: { A: grp-a, B: grp-b, C: grp-c }
+    engLeadGroup: { D: grp-d-leads }
+    allApprovalDomains: [A]          # A plays the platform domain
+    noApprovalDomains: [D]
+  directory:
+    grp-a: [alice, rita]
+    grp-b: [bob]
+    grp-c: []
+    grp-d-leads: [lee, lara]
+  people: { requester: rita, engLead: lee, admin: root-admin }
+  membersA: &members_a { groups: [ { id: grp-a, members: [alice, rita] } ] }
+  membersB: &members_b { groups: [ { id: grp-b, members: [bob] } ] }
+  membersC: &members_c { groups: [ { id: grp-c, members: [] } ] }
+  leadsD: &leads_d { groups: [ { id: grp-d-leads, members: [lee, lara] } ] }
+  leadsEmpty: &leads_empty { groups: [ { id: grp-d-leads, members: [] } ] }
+
+# Shared turns.
+openings:
+  # Primary domain A (all domains approve), one other domain B.
+  start_ab: &start_ab
+    input: { start: { by: rita, input: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start, patch: { form: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+      - [StageEntered, { activation: a2, stage: Route, parentActivation: a1 }]
+      - [TransitionFired, { transition: t_all, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: PendingAll, parentActivation: a1 }]
+      - [WaitOpened, { wait: PendingAll.primary.members@a3, kind: call, connector: directory, op: membersOf, args: { groups: [grp-a] } }]
+      - [WaitOpened, { wait: PendingAll.primary.decision@a3, kind: person, role: obligation, assignees: ["group:grp-a"] }]
+      - [WaitOpened, { wait: PendingAll.others.members@a3, kind: call, connector: directory, op: membersOf, args: { groups: [grp-b] } }]
+      - [WaitOpened, { wait: "PendingAll.others.decision[B]@a3", kind: person, role: obligation, assignees: ["group:grp-b"] }]
+    notify: [n_task, n_task]
+  # Primary domain A (all domains approve), one other domain C whose group is empty.
+  start_ac: &start_ac
+    input: { start: { by: rita, input: { title: "New dashboard", primaryDomain: A, otherDomains: [C] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Route }]
+      - [TransitionFired, { transition: t_all, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: PendingAll }]
+      - [WaitOpened, { wait: PendingAll.primary.members@a3, args: { groups: [grp-a] } }]
+      - [WaitOpened, { wait: PendingAll.primary.decision@a3 }]
+      - [WaitOpened, { wait: PendingAll.others.members@a3, args: { groups: [grp-c] } }]
+      - [WaitOpened, { wait: "PendingAll.others.decision[C]@a3", assignees: ["group:grp-c"] }]
+  primary_members_ok: &primary_members_ok
+    input: { callResult: { wait: PendingAll.primary.members@a3, outcome: ok, data: *members_a } }
+    expect:
+      - [WaitCompleted, { wait: PendingAll.primary.members@a3, outcome: ok, by: "connector:directory" }]
+    notify: []          # alice can approve; rita is the requester
+  others_members_b_ok: &others_members_b_ok
+    input: { callResult: { wait: PendingAll.others.members@a3, outcome: ok, data: *members_b } }
+    expect:
+      - [WaitCompleted, { wait: PendingAll.others.members@a3, outcome: ok, by: "connector:directory" }]
+    notify: []
+  others_members_c_ok: &others_members_c_ok
+    input: { callResult: { wait: PendingAll.others.members@a3, outcome: ok, data: *members_c } }
+    expect:
+      - [WaitCompleted, { wait: PendingAll.others.members@a3, outcome: ok, by: "connector:directory" }]
+    notify: [PendingAll.others.noApprover]
+  # Primary domain B (the primary alone decides), one other domain A.
+  start_domain_ab: &start_domain_ab
+    input: { start: { by: rita, input: { title: "Add column", primaryDomain: B, otherDomains: [A] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Route }]
+      - [TransitionFired, { transition: t_domain, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: PendingPrimary }]
+      - [WaitOpened, { wait: PendingPrimary.primary.members@a3, args: { groups: [grp-b] } }]
+      - [WaitOpened, { wait: PendingPrimary.primary.decision@a3, role: obligation, assignees: ["group:grp-b"] }]
+      - [WaitOpened, { wait: "PendingPrimary.others.decision[A]@a3", role: option, assignees: ["group:grp-a"] }]
+    notify: [n_task, PendingPrimary.others.notify]     # no members call and no noApprover rule for the optional approval
+  # No-approval domain D.
+  start_d: &start_d
+    input: { start: { by: rita, input: { title: "Fix label", primaryDomain: D, otherDomains: [] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Route }]
+      - [TransitionFired, { transition: t_skip, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: AssignLead }]
+      - [WaitOpened, { wait: AssignLead.leads@a3, kind: call, connector: directory, op: membersOf, args: { groups: [grp-d-leads] } }]
+    notify: []          # nobody is asked to approve
+
+cases:
+
+  - id: T1
+    name: All-approve path, happy path with one other domain
+    turns:
+      - *start_ab
+      - *primary_members_ok
+      - *others_members_b_ok
+      - input: { act: { by: bob, wait: "PendingAll.others.decision[B]@a3", outcome: approve, data: {} } }
+        expect:
+          - [WaitCompleted, { wait: "PendingAll.others.decision[B]@a3", outcome: approve, by: bob, evidence: { memberOf: [grp-b] } }]
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.decision@a3, outcome: approve, by: alice, evidence: { memberOf: [grp-a] } }]
+          - [TransitionFired, { transition: t_accept, activation: a3 }]
+          - [DataSet, { source: transition, element: t_accept, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, kind: person, role: obligation, assignees: ["user:lee"] }]
+        notify: [n_task]
+      - input: { act: { by: lee, wait: InDevelopment.release.task@a4, outcome: released, data: {} } }
+        expect:
+          - [WaitCompleted, { wait: InDevelopment.release.task@a4, outcome: released, by: lee }]
+          - [TransitionFired, { transition: t_release, activation: a4 }]
+          - [StageExited, { activation: a4, mode: normal }]
+          - [StageEntered, { activation: a5, stage: Released, parentActivation: a1 }]
+          - [RequestClosed, { stage: Released }]
+
+  - id: T2
+    name: All-approve path, no other domains; the primary approval alone accepts
+    turns:
+      - input: { start: { by: rita, input: { title: "Tune alert", primaryDomain: A, otherDomains: [] } } }
+        expect:
+          - [RequestStarted, { by: rita }]
+          - [DataSet, { source: start }]
+          - [StageEntered, { activation: a1, stage: root }]
+          - [StageEntered, { activation: a2, stage: Route }]
+          - [TransitionFired, { transition: t_all, activation: a2 }]
+          - [StageExited, { activation: a2, mode: normal }]
+          - [StageEntered, { activation: a3, stage: PendingAll }]
+          - [WaitOpened, { wait: PendingAll.primary.members@a3, args: { groups: [grp-a] } }]
+          - [WaitOpened, { wait: PendingAll.primary.decision@a3 }]
+          - [WaitOpened, { wait: PendingAll.others.members@a3, args: { groups: [] } }]   # opened even for an empty list; no others.decision waits
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.decision@a3, outcome: approve, by: alice }]
+          - [TransitionFired, { transition: t_accept, activation: a3 }]
+          - [DataSet, { source: transition, patch: { engLead: lee } }]
+          - [WaitCancelled, { wait: PendingAll.primary.members@a3, cause: stage exit }]   # both directory calls were still in flight
+          - [WaitCancelled, { wait: PendingAll.others.members@a3, cause: stage exit }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4 }]
+      - input: { callResult: { wait: PendingAll.primary.members@a3, outcome: ok, data: *members_a } }
+        expect:
+          - [CallResultLate, { wait: PendingAll.primary.members@a3, outcome: ok }]
+        notify: []          # a late result does not trigger a no-approver rule
+
+  - id: T3
+    name: All-approve path, a domain has no eligible approver; the request is submitted and waits
+    turns:
+      - *start_ac
+      - *primary_members_ok
+      - *others_members_c_ok
+    finalState: { activeStages: [root, PendingAll], open: [PendingAll.primary.decision@a3, "PendingAll.others.decision[C]@a3"], faulted: false }
+
+  - id: T4
+    name: Refused attempts write nothing to history
+    turns:
+      - *start_ab
+      - input: { act: { by: rita, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        refuse: { reason: may }              # rita is in grp-a but is the requester
+        expect: []
+      - input: { act: { by: bob, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        refuse: { reason: not-assignee }     # bob is not in grp-a
+        expect: []
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: {} } }
+        refuse: { reason: invalid-data }     # engLead is required to approve
+        expect: []
+
+  - id: T5
+    name: All-approve path, one rejection rejects the request and cancels the approvals still open
+    turns:
+      - *start_ab
+      - *primary_members_ok
+      - *others_members_b_ok
+      - input: { act: { by: bob, wait: "PendingAll.others.decision[B]@a3", outcome: reject, data: { reason: "Out of scope" } } }
+        expect:
+          - [WaitCompleted, { wait: "PendingAll.others.decision[B]@a3", outcome: reject, by: bob }]
+          - [TransitionFired, { transition: t_reject, activation: a3 }]
+          - [WaitCancelled, { wait: PendingAll.primary.decision@a3, cause: stage exit }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: Rejected, parentActivation: a1 }]
+          - [RequestClosed, { stage: Rejected }]
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        refuse: { reason: wait-not-open }
+        expect: []
+
+  - id: T6
+    name: Admin skips a domain's approval and jumps, in one turn
+    turns:
+      - *start_ac
+      - *primary_members_ok
+      - *others_members_c_ok
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.decision@a3, outcome: approve, by: alice }]   # t_accept is false: others.decision[C] is open
+      - input:
+          admin:
+            by: root-admin
+            reason: "Domain C has no approvers; approved out of band, ticket OPS-1"
+            actions:
+              - { skip: "PendingAll.others.decision[C]@a3" }
+              - { setData: { engLead: lee } }
+              - { jump: { from: PendingAll, to: InDevelopment } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [WaitSkipped, { wait: "PendingAll.others.decision[C]@a3" }]
+          - [DataSet, { source: admin, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+
+  - id: T6b
+    name: A skip alone decides nothing and leaves the request stuck
+    turns:
+      - same-as: T6 turns 1 to 4
+      - input:
+          admin: { by: root-admin, reason: "Domain C has no approvers", actions: [ { skip: "PendingAll.others.decision[C]@a3" } ], waived: [] }
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [WaitSkipped, { wait: "PendingAll.others.decision[C]@a3" }]
+          - [Faulted, { kind: stuck }]       # t_accept stays false; no obligation or call is open
+    finalState: { activeStages: [root, PendingAll], open: [], faulted: true }
+
+  - id: T7
+    name: Admin jumps while the directory calls are in flight
+    turns:
+      - *start_ab
+      - input:
+          admin:
+            by: root-admin
+            reason: "Sev1 hotfix"
+            actions:
+              - { setData: { engLead: lee } }
+              - { jump: { from: PendingAll, to: InDevelopment } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [DataSet, { source: admin, patch: { engLead: lee } }]
+          - [WaitSkipped, { wait: PendingAll.primary.members@a3 }]
+          - [WaitSkipped, { wait: PendingAll.primary.decision@a3 }]
+          - [WaitSkipped, { wait: PendingAll.others.members@a3 }]
+          - [WaitSkipped, { wait: "PendingAll.others.decision[B]@a3" }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4 }]
+      - input: { callResult: { wait: PendingAll.primary.members@a3, outcome: ok, data: *members_a } }
+        expect:
+          - [CallResultLate, { wait: PendingAll.primary.members@a3, outcome: ok }]
+
+  - id: T7b
+    name: A jump without the data the target stage requires is refused
+    turns:
+      - *start_ab
+      - input:
+          admin: { by: root-admin, reason: "Sev1 hotfix", actions: [ { jump: { from: PendingAll, to: InDevelopment } } ], waived: [] }
+        refuse: { reason: requires-not-met, paths: [engLead] }
+        expect: []
+
+  - id: T8
+    name: A CEL error rolls the turn back and faults the request
+    turns:
+      - input: { start: { by: rita, input: { title: "Typo domain", primaryDomain: Z, otherDomains: [] } } }
+        expect:
+          - [RequestStarted, { by: rita }]
+          - [Faulted, { kind: error, element: PendingPrimary.primary.members }]    # approverGroup has no key Z; the routing is rolled back too
+      - input:
+          admin: { by: root-admin, reason: "Unknown domain; requester to resubmit", actions: [ { close: {} } ], waived: [] }
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [RequestClosed, { by: admin }]
+    finalState: { activeStages: [], open: [], closed: true }
+
+  - id: T9
+    name: Domain path, another domain's decision has no effect; the primary alone accepts
+    turns:
+      - *start_domain_ab
+      - input: { callResult: { wait: PendingPrimary.primary.members@a3, outcome: ok, data: *members_b } }
+        expect:
+          - [WaitCompleted, { wait: PendingPrimary.primary.members@a3, outcome: ok, by: "connector:directory" }]
+        notify: []
+      - input: { act: { by: alice, wait: "PendingPrimary.others.decision[A]@a3", outcome: reject, data: { reason: "Not keen" } } }
+        expect:
+          - [WaitCompleted, { wait: "PendingPrimary.others.decision[A]@a3", outcome: reject, by: alice }]   # recorded; no transition reads it
+      - input: { act: { by: bob, wait: PendingPrimary.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingPrimary.primary.decision@a3, outcome: approve, by: bob }]
+          - [TransitionFired, { transition: t_accept, activation: a3 }]
+          - [DataSet, { source: transition, element: t_accept, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+        notify: [n_task]
+
+  - id: T10
+    name: Domain path, the primary's decision closes the other domains' open actions
+    turns:
+      - *start_domain_ab
+      - input: { act: { by: bob, wait: PendingPrimary.primary.decision@a3, outcome: reject, data: { reason: "Duplicate" } } }
+        expect:
+          - [WaitCompleted, { wait: PendingPrimary.primary.decision@a3, outcome: reject, by: bob }]
+          - [TransitionFired, { transition: t_reject, activation: a3 }]
+          - [WaitCancelled, { wait: PendingPrimary.primary.members@a3, cause: stage exit }]
+          - [WaitCancelled, { wait: "PendingPrimary.others.decision[A]@a3", cause: stage exit }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: Rejected, parentActivation: a1 }]
+          - [RequestClosed, { stage: Rejected }]
+      - input: { act: { by: alice, wait: "PendingPrimary.others.decision[A]@a3", outcome: approve, data: {} } }
+        refuse: { reason: wait-not-open }
+        expect: []
+
+  - id: T11
+    name: No-approval path, the eng lead is the first member of the domain's eng-lead group
+    turns:
+      - *start_d
+      - input: { callResult: { wait: AssignLead.leads@a3, outcome: ok, data: *leads_d } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a3, outcome: ok, by: "connector:directory" }]
+          - [TransitionFired, { transition: t_lead, activation: a3 }]
+          - [DataSet, { source: transition, element: t_lead, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+        notify: [n_task]    # the only notification on this path
+
+  - id: T12
+    name: No-approval path, an empty eng-lead group faults; an admin retries by re-entering the stage
+    turns:
+      - *start_d
+      - input: { callResult: { wait: AssignLead.leads@a3, outcome: ok, data: *leads_empty } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a3, outcome: ok, by: "connector:directory" }]
+          - [Faulted, { kind: error, element: t_lead }]      # members[0] on an empty list
+      - input:
+          admin:
+            by: root-admin
+            reason: "Eng-lead group for D was empty; fixed in the directory"
+            actions:
+              - { clearFault: {} }
+              - { jump: { from: AssignLead, to: AssignLead } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: AssignLead, parentActivation: a1 }]
+          - [WaitOpened, { wait: AssignLead.leads@a4, kind: call }]     # a new read; t_lead is false while it is open
+      - input: { callResult: { wait: AssignLead.leads@a4, outcome: ok, data: *leads_d } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a4, outcome: ok }]
+          - [TransitionFired, { transition: t_lead, activation: a4 }]
+          - [DataSet, { source: transition, element: t_lead, patch: { engLead: lee } }]
+          - [StageExited, { activation: a4, mode: normal }]
+          - [StageEntered, { activation: a5, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a5 }]
+
+  - id: T12b
+    name: No-approval path, an admin bypasses the lookup by setting the eng lead
+    turns:
+      - same-as: T12 turns 1 to 2
+      - input:
+          admin:
+            by: root-admin
+            reason: "Eng-lead group for D is empty; lee confirmed by email"
+            actions:
+              - { clearFault: {} }
+              - { setData: { engLead: lee } }
+              - { jump: { from: AssignLead, to: InDevelopment } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [DataSet, { source: admin, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+
+  - id: T12c
+    name: No-approval path, a failed directory lookup faults; an admin retries by re-entering the stage
+    turns:
+      - *start_d
+      - input: { callResult: { wait: AssignLead.leads@a3, outcome: failed, data: { error: "group not found" } } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a3, outcome: failed, by: "connector:directory" }]
+          - [Faulted, { kind: error, element: AssignLead.leads }]      # leads has no onFailure: outcome
+      - same-as: T12 turns 3 to 4
+
+  - id: T3b
+    name: All-approve path, a failed membership check does not stop the request
+    turns:
+      - *start_ab
+      - input: { callResult: { wait: PendingAll.primary.members@a3, outcome: failed, data: { error: "directory unavailable" } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.members@a3, outcome: failed, by: "connector:directory" }]   # onFailure: outcome; no fault
+        notify: [PendingAll.primary.noApprover]
+    finalState: { activeStages: [root, PendingAll], faulted: false }

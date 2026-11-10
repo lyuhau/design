@@ -1,947 +1,4 @@
-===\n./expansion-battery.md\n===
-# Expansion test battery
-
-Each case is a workflow expanded into the kernel's blocks and events on paper. A case passes when it uses only what the kernel spec defines. The battery is also the record of why fields exist: if a case can no longer be expressed, something it needs was removed.
-
-Cases the MVP builds have test cases as data in `test-cases/` (definition, inputs, exact events expected). The others stay on paper, with small replay-only cases for the insurance fields.
-
-| Case | Workflow | Built in the MVP | Status | Test data |
-|---|---|---|---|---|
-| C1 | Change request | Yes | Passes on spec v2.7 | `test-cases/c1-change-request.yaml` (T1 to T8) |
-| C2 | Metric change control | No | Expressible with reserved features; the revise-and-reapprove loop is a known weak spot | Paper |
-| C3 | Checklist item ticked, un-ticked, re-ticked | No | Representation only | `test-cases/replay-only.yaml` R2 |
-| P1 | Start without waiting, join later | No | Passes with child requests | Paper; R3 covers the parent field |
-| P2 | Work that survives a send-back | No | Passes with child requests | Paper; R3 |
-| P3 | Fan-out where each leg runs several steps | No | Passes with child requests | Paper |
-| P4 | Two stage paths active at once | No | Representation only | `test-cases/replay-only.yaml` R1 |
-| I1 | Ten repeated in-stage actions | No | 3 of 10 clean with repeatable waits; the rest need an undesigned layer; history is safe for all | Paper; reports in `instage-test/` |
-
-## C1. Change request
-
-The definition and the happy-path trace are in section 9 of `kernel-spec.md`. The edge cases are T2 to T8 in `test-cases/c1-change-request.yaml`.
-
-Passes if: every trace uses only the events in section 5 of the spec.
-
-Needs: `foreach` on person waits; the guarded wait-status record; `CallResultLate`; admin skip of a single wait; stage `requires` with supply-or-waive on a jump; notification rules.
-
-## C2. Metric change control
-
-Source: `~/Downloads/ETIP_Change_Control_Governance_TRD.md`. A card moves through New Request, Discovery, Pending Approval, Pending Implementation, Deployed and Archived, operated by a Concierge.
-
-How it maps:
-- Each lane is a stage. Cancel is a wait on the root stage.
-- The Concierge moving a card is a person wait whose outcome fires the transition.
-- Discovery edits re-enter the stage. Nothing is lost, because no approvals exist there.
-- In Pending Approval, each checklist item is its own person wait (`foreach` over the items for the change type), and each forum outcome is a wait. Notes and links are comments, outside the kernel.
-- The AE approval round is a child request, awaited in Pending Approval with `onCancel: terminate`.
-- The move to Pending Implementation is one wait with two outcomes, each with act-time gates.
-
-```
-PendingApproval:
-  waits:
-    items:   person { foreach: data.checklist, assignees: [group: concierge], outcomes: [done] }
-    forums:  person { foreach: data.forums, assignees: [group: concierge], outcomes: { recorded: {...} } }
-    approval: child { request: data.approvalId, onCancel: terminate }
-    advance: person { assignees: [group: concierge], outcomes:
-      { advance:   { may: [ { id: checklist, when: required items done },
-                            { id: ae,        when: waits.approval.outcome == 'approved' },
-                            { id: curation,  when: now >= data.minGoLive } ] },
-        fastTrack: { may: [ { id: ae, when: waits.approval.outcome == 'approved' } ],
-                     data: { comment: string } } } }
-  t: when waits.advance.outcome in ['advance', 'fastTrack']  set { override: ... }  -> PendingImplementation
-```
-
-Passes if: ticking a checklist item does not disturb an AE approval in progress; a blocked move tells the Concierge which check failed; a fast track records its comment; a rejection keeps the card in Pending Approval.
-
-Needs: act-time gates; child requests; `foreach` on person waits.
-
-Known weak spot: revise and re-approve. After a rejection the approval child has closed, and a second approval round in the same stage entry needs either a second instance of the await (repeatable waits) or a re-entry that resets the checklist. The child also holds a snapshot of the card from when it started. Revisit when change control is built.
-
-## C3. Checklist item ticked, un-ticked, re-ticked
-
-In C2's Pending Approval, the Concierge ticks an item, un-ticks it, and ticks it again, while an AE approval is in progress.
-
-Passes if: the history can hold a second instance of the same wait in the same stage entry (`seq` 2), and the AE approval is not reset.
-
-Needs: `seq` in the wait ID.
-
-## I1. Repeated in-stage actions
-
-Ten patterns, each expanded under three models: data-driven (an action is a validated write), event-driven (named events with handlers), and the hybrid in the spec (a repeatable wait with its own Set). A fourth agent tried to show that the history favours one model. Reports: `instage-test/`.
-
-1. Checkbox: tick, un-tick, re-tick; a gate needs all required items.
-2. Field edit, several times; the latest value is used.
-3. Question and answer while an approval stays open.
-4. Reassign an open task.
-5. Add or remove a reviewer mid-review.
-6. An edit that dismisses approvals already given.
-7. An external call on every use, with its result known to the workflow.
-8. Two people act on the same item at once.
-9. A correction; audit shows both values.
-10. A value derived from several in-stage actions.
-
-Result: the three models differ in the definition language, not in the history. Each action records the action and its data write, linked by `turn`; no old history becomes unreplayable under any model. From the hybrid, moving to data-driven needs no history change, and moving to event-driven needs only additions. The hybrid alone handles 3 of the 10 cleanly; the limits are listed in the spec, section 8.
-
-Needs: the patch format in `DataSet`; `DataSet.element` and source `wait`; open payload enums; `seq` as an ordinal with "highest is current"; `turn` as the causing input on the fault path; typed `by`.
-
-## Child rules assumed (to be written into the spec as reserved)
-
-- **Start** is a call: `call { connector: engine, op: start, args: { workflow, version, input }, effect: write }`. Its result is `{ requestId }`. Default idempotency key is per request, so re-entering the stage returns the same child. The child's `RequestStarted` carries `parent: { requestId, wait }`.
-- **Await** is a wait of kind `child`: `{ request: <CEL -> requestId>, onCancel: detach | terminate }`. It completes with the child's final stage as outcome and the child's output as data.
-- An await **never completes in the turn that opens it**. Completion always arrives as a later input, through the same delivery path whether the child closed long ago or just now. `decide` never reads another request's state.
-- Cancelling an await (its stage is exited) leaves the child running when `detach`, and closes it when `terminate`. A parent closing a child is recorded in the child's history as `Overridden` by a system identity.
-- A parent's definition pins the child workflow's version, so the publish check can verify the outcomes its conditions read.
-
-## P1. Start without waiting, join later (initiative intake)
-
-A starts S and moves on; A goes to one of B, C, D; E needs one of B/C/D and also S; S's outcome can divert the parent.
-
-```
-A:       waits: a: person {...}                          t: when a done -> StartS
-StartS:  waits: start: call { engine.start, workflow: S }
-         t: when start ok  set { sId: waits.start.data.requestId }  -> B | C | D (by data)
-B:       waits: b: person {...}
-                s: child { request: data.sId, onCancel: detach }
-         t_div:  when waits.s.outcome == 'declined'  -> F
-         t_done: when waits.b.outcome == 'done'      -> E
-(C, D likewise)
-E:       waits: s: child { request: data.sId, onCancel: detach }
-         t_div: when waits.s.outcome == 'declined'  -> F
-         t_go:  when waits.s.outcome == 'approved'  -> Work
-```
-
-Events used: `WaitOpened {kind: call}`, `WaitCompleted`, `DataSet`, `WaitOpened {kind: child}`, `WaitCancelled {cause: stage exit}` (the await in B when moving to E), `WaitOpened {kind: child}` again in E, `WaitCompleted`. In S's history: `RequestStarted {parent}`.
-
-Passes if: S finishing before, during or after B gives the same parent path; leaving B never closes S.
-
-Needs: `RequestStarted.parent`; `WaitOpened` params for kind child (`request`, `onCancel`).
-
-## P2. Work that survives a send-back (design review)
-
-Stage Build starts a prototype; stage 10 sends the request back to Draft; the prototype keeps running with its own status; a later stage reads its result.
-
-```
-Build:   waits: start: call { engine.start, workflow: Prototype }      (key: per request)
-         t: when start ok  set { protoId: waits.start.data.requestId }  -> Next
-...
-Late:    waits: lead: person { outcomes: [advance, sendBack] }
-         t_back: when waits.lead.outcome == 'sendBack'  -> Draft
-Final:   waits: proto: child { request: data.protoId, onCancel: detach }
-```
-
-Passes if: after `t_back` the prototype's history shows no event caused by the parent; re-entering Build returns the same `requestId` (no second prototype); the parent's page can list the prototype and its current stage through `parent`.
-
-Needs: per-request idempotency key on write calls; `RequestStarted.parent`.
-
-## P3. Fan-out where each leg runs several steps (design review)
-
-Each reviewer gets a thread (question, answer, verdict). Verdicts combine: one veto sends back; two approvals accept.
-
-```
-StartThreads: waits: start: call { foreach: data.reviewers, engine.start, workflow: ReviewerThread,
-                                   key: item + '/' + string(data.round) }
-              t: when waits.start.all(w, w.outcome == 'ok')
-                 set { threads: waits.start.map(w, w.data.requestId) }  -> Review
-Review:       waits: threads: child { foreach: data.threads, request: item, onCancel: terminate }
-              t_veto: when waits.threads.exists(w, w.outcome == 'veto')
-                      set { round: data.round + 1 }                      -> Draft
-              t_ok:   when waits.threads.filter(w, w.outcome == 'approve').size() >= 2  -> Accepted
-```
-
-Passes if: each thread has its own visible stage; a veto closes the other threads (their reviewers' tasks disappear) and each closed thread's history shows `Overridden` by the system identity; the second round starts new threads, not the closed ones.
-
-Needs: `foreach` on call and child waits; `onCancel: terminate`; the round counter in the start key.
-
-## P4. Two stage paths active at once in one request (representation only)
-
-Not supported by the spec's rules: exactly one child stage is active. This case checks only that the history and stored state could represent it, so that adding it later needs no change to old events.
-
-Passes if: a history containing `StageEntered {activation: a2, parent: a1}` and `StageEntered {activation: a3, parent: a1}` with neither exited replays to a state holding both; the request table stores active stages as a list.
-
-Needs: `StageEntered.parentActivation`; active stages stored as a set.
-
-## Result of the first run (paper)
-
-- P1, P2, P3 are expressible with child requests. No new event type.
-- P4 is representable once `StageEntered` carries its parent activation.
-- Fields to add: `RequestStarted.parent`; `StageEntered.parentActivation`; child params on `WaitOpened`.
-- Rules to add: the five child rules above.
-- Costs seen: the await on S is repeated in every stage that needs it (or needs a third nesting level); a fan-out takes two stages (start, then await); fan-out re-entry needs a round counter in the key, which a composite should own; a child gets the parent's data only as a snapshot at start.
-===\n./test-cases/replay-only.yaml\n===
-# Replay-only cases, against kernel-spec.md v2.7.
-# `by` shorthand is as in c1-change-request.yaml.
-#
-# The MVP's `decide` never produces these histories. Each case checks that `evolve` can replay a
-# history that uses an insurance field, so the field is not dropped. Given the events, replay must
-# produce the expected state.
-
-cases:
-
-  - id: R1
-    name: Two child stages active at once (battery P4)
-    needs: [StageEntered.parentActivation, "active stages stored as a set"]
-    history:
-      - [RequestStarted, { by: rita }]
-      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
-      - [StageEntered, { activation: a2, stage: Legal, parentActivation: a1 }]
-      - [StageEntered, { activation: a3, stage: Security, parentActivation: a1 }]
-      - [WaitOpened, { wait: Legal.review@a2, kind: person, role: obligation }]
-      - [WaitOpened, { wait: Security.review@a3, kind: person, role: obligation }]
-      - [WaitCompleted, { wait: Legal.review@a2, outcome: approve, by: lena }]
-      - [StageExited, { activation: a2, mode: normal }]
-    expectState:
-      activeStages: [ { activation: a1, stage: root }, { activation: a3, stage: Security, parent: a1 } ]
-      open: [Security.review@a3]
-
-  - id: R2
-    name: A second instance of the same wait in one stage entry (battery C3)
-    needs: [wait ID seq]
-    history:
-      - [RequestStarted, { by: rita }]
-      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
-      - [StageEntered, { activation: a2, stage: PendingApproval, parentActivation: a1 }]
-      - [WaitOpened, { wait: "PendingApproval.items[lineage]@a2", seq: 1, kind: person }]
-      - [WaitOpened, { wait: PendingApproval.approval@a2, seq: 1, kind: person }]
-      - [WaitCompleted, { wait: "PendingApproval.items[lineage]@a2", seq: 1, outcome: done, by: cara }]
-      - [WaitOpened, { wait: "PendingApproval.items[lineage]@a2", seq: 2, kind: person }]
-    expectState:
-      activeStages: [ { activation: a1, stage: root }, { activation: a2, stage: PendingApproval, parent: a1 } ]
-      waits:
-        - { wait: "PendingApproval.items[lineage]@a2", seq: 1, status: completed }
-        - { wait: "PendingApproval.items[lineage]@a2", seq: 2, status: open }
-        - { wait: PendingApproval.approval@a2, seq: 1, status: open }
-
-  - id: R3
-    name: A child request records its parent (battery P1, P2)
-    needs: [RequestStarted.parent]
-    history:
-      - [RequestStarted, { by: "system:engine", parent: { requestId: req-100, wait: Build.start@a4 } }]
-      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
-    expectState:
-      parent: { requestId: req-100, wait: Build.start@a4 }
-===\n./test-cases/c1-change-request.yaml\n===
-# Test cases for the change request (battery case C1), against kernel-spec.md v2.7.
-#
-# These are data, not code. Each case is: a list of inputs, and for each input either the exact
-# events the engine must append (in order) or a refusal. No harness exists yet.
-#
-# Conventions
-# - The definition under test is the one in kernel-spec.md section 9.
-# - Element IDs are <composite instance>.<local name>: primary.decision, others.members, release.task.
-# - Activation IDs are symbolic: a1 is the root, a2 the first child stage entered, and so on.
-# - A wait is written <stage>.<element>[<foreach key>]@<activation>. seq is 1 everywhere and omitted.
-# - Envelope fields (requestId, seq, at, turn, v, engineBuild) are not listed. `turn` of every
-#   event in a block is the seq of that block's first event.
-# - Payload fields not listed are not asserted.
-# - `by: rita` is short for { type: user, id: rita }; `by: "connector:directory"` for
-#   { type: connector, id: directory }; `by: "system:engine"` for { type: system, id: engine }.
-# - `patch: { engLead: lee }` is short for [ { op: set, path: engLead, value: lee } ].
-# - `notify` lists the notification rules the notifier must match for that turn. It is checked
-#   against the notifier, not the engine: notifications are not history events.
-
-fixtures:
-  constants:
-    approverGroup: { A: grp-a, B: grp-b, C: grp-c }
-  directory:
-    grp-a: [alice, rita]
-    grp-b: [bob]
-    grp-c: []
-  people: { requester: rita, engLead: lee, admin: root-admin }
-  membersA: &members_a { groups: [ { id: grp-a, members: [alice, rita] } ] }
-  membersB: &members_b { groups: [ { id: grp-b, members: [bob] } ] }
-  membersC: &members_c { groups: [ { id: grp-c, members: [] } ] }
-
-# Shared turns.
-openings:
-  # Primary domain A and one other domain B.
-  start_ab: &start_ab
-    input: { start: { by: rita, input: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }
-    expect:
-      - [RequestStarted, { by: rita }]
-      - [DataSet, { source: start, patch: { form: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }]
-      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
-      - [StageEntered, { activation: a2, stage: Pending, parentActivation: a1 }]
-      - [WaitOpened, { wait: Pending.primary.members@a2, kind: call, connector: directory, op: membersOf, args: { groups: [grp-a] } }]
-      - [WaitOpened, { wait: Pending.primary.decision@a2, kind: person, role: obligation, assignees: ["group:grp-a"] }]
-      - [WaitOpened, { wait: Pending.others.members@a2, kind: call, connector: directory, op: membersOf, args: { groups: [grp-b] } }]
-      - [WaitOpened, { wait: "Pending.others.decision[B]@a2", kind: person, role: obligation, assignees: ["group:grp-b"] }]
-    notify: [n_task, n_task]
-  # Primary domain A and one other domain C, whose group is empty.
-  start_ac: &start_ac
-    input: { start: { by: rita, input: { title: "New dashboard", primaryDomain: A, otherDomains: [C] } } }
-    expect:
-      - [RequestStarted, { by: rita }]
-      - [DataSet, { source: start }]
-      - [StageEntered, { activation: a1, stage: root }]
-      - [StageEntered, { activation: a2, stage: Pending }]
-      - [WaitOpened, { wait: Pending.primary.members@a2, args: { groups: [grp-a] } }]
-      - [WaitOpened, { wait: Pending.primary.decision@a2 }]
-      - [WaitOpened, { wait: Pending.others.members@a2, args: { groups: [grp-c] } }]
-      - [WaitOpened, { wait: "Pending.others.decision[C]@a2", assignees: ["group:grp-c"] }]
-  primary_members_ok: &primary_members_ok
-    input: { callResult: { wait: Pending.primary.members@a2, outcome: ok, data: *members_a } }
-    expect:
-      - [WaitCompleted, { wait: Pending.primary.members@a2, outcome: ok, by: "connector:directory" }]
-    notify: []          # alice can approve; rita is the requester
-  others_members_b_ok: &others_members_b_ok
-    input: { callResult: { wait: Pending.others.members@a2, outcome: ok, data: *members_b } }
-    expect:
-      - [WaitCompleted, { wait: Pending.others.members@a2, outcome: ok, by: "connector:directory" }]
-    notify: []
-  others_members_c_ok: &others_members_c_ok
-    input: { callResult: { wait: Pending.others.members@a2, outcome: ok, data: *members_c } }
-    expect:
-      - [WaitCompleted, { wait: Pending.others.members@a2, outcome: ok, by: "connector:directory" }]
-    notify: [others.noApprover]
-
-cases:
-
-  - id: T1
-    name: Happy path with one other domain
-    turns:
-      - *start_ab
-      - *primary_members_ok
-      - *others_members_b_ok
-      - input: { act: { by: bob, wait: "Pending.others.decision[B]@a2", outcome: approve, data: {} } }
-        expect:
-          - [WaitCompleted, { wait: "Pending.others.decision[B]@a2", outcome: approve, by: bob, evidence: { memberOf: [grp-b] } }]
-      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
-        expect:
-          - [WaitCompleted, { wait: Pending.primary.decision@a2, outcome: approve, by: alice, evidence: { memberOf: [grp-a] } }]
-          - [TransitionFired, { transition: t_accept, activation: a2 }]
-          - [DataSet, { source: transition, element: t_accept, patch: { engLead: lee } }]
-          - [StageExited, { activation: a2, mode: normal }]
-          - [StageEntered, { activation: a3, stage: InDevelopment, parentActivation: a1 }]
-          - [WaitOpened, { wait: InDevelopment.release.task@a3, kind: person, role: obligation, assignees: ["user:lee"] }]
-        notify: [n_task]
-      - input: { act: { by: lee, wait: InDevelopment.release.task@a3, outcome: released, data: {} } }
-        expect:
-          - [WaitCompleted, { wait: InDevelopment.release.task@a3, outcome: released, by: lee }]
-          - [TransitionFired, { transition: t_release, activation: a3 }]
-          - [StageExited, { activation: a3, mode: normal }]
-          - [StageEntered, { activation: a4, stage: Released, parentActivation: a1 }]
-          - [RequestClosed, { stage: Released }]
-
-  - id: T2
-    name: No other domains; the primary approval alone accepts
-    turns:
-      - input: { start: { by: rita, input: { title: "Tune alert", primaryDomain: A, otherDomains: [] } } }
-        expect:
-          - [RequestStarted, { by: rita }]
-          - [DataSet, { source: start }]
-          - [StageEntered, { activation: a1, stage: root }]
-          - [StageEntered, { activation: a2, stage: Pending }]
-          - [WaitOpened, { wait: Pending.primary.members@a2, args: { groups: [grp-a] } }]
-          - [WaitOpened, { wait: Pending.primary.decision@a2 }]
-          - [WaitOpened, { wait: Pending.others.members@a2, args: { groups: [] } }]   # opened even for an empty list; no others.decision waits
-      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
-        expect:
-          - [WaitCompleted, { wait: Pending.primary.decision@a2, outcome: approve, by: alice }]
-          - [TransitionFired, { transition: t_accept, activation: a2 }]
-          - [DataSet, { source: transition, patch: { engLead: lee } }]
-          - [WaitCancelled, { wait: Pending.primary.members@a2, cause: stage exit }]   # both directory calls were still in flight
-          - [WaitCancelled, { wait: Pending.others.members@a2, cause: stage exit }]
-          - [StageExited, { activation: a2, mode: normal }]
-          - [StageEntered, { activation: a3, stage: InDevelopment }]
-          - [WaitOpened, { wait: InDevelopment.release.task@a3 }]
-      - input: { callResult: { wait: Pending.primary.members@a2, outcome: ok, data: *members_a } }
-        expect:
-          - [CallResultLate, { wait: Pending.primary.members@a2, outcome: ok }]
-        notify: []          # a late result does not trigger a no-approver rule
-
-  - id: T3
-    name: A domain has no eligible approver; the request is submitted and waits
-    turns:
-      - *start_ac
-      - *primary_members_ok
-      - *others_members_c_ok
-    finalState: { activeStages: [root, Pending], open: [Pending.primary.decision@a2, "Pending.others.decision[C]@a2"], faulted: false }
-
-  - id: T4
-    name: Refused attempts write nothing to history
-    turns:
-      - *start_ab
-      - input: { act: { by: rita, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
-        refuse: { reason: may }              # rita is in grp-a but is the requester
-        expect: []
-      - input: { act: { by: bob, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
-        refuse: { reason: not-assignee }     # bob is not in grp-a
-        expect: []
-      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: {} } }
-        refuse: { reason: invalid-data }     # engLead is required to approve
-        expect: []
-
-  - id: T5
-    name: One rejection rejects the request and cancels the approvals still open
-    turns:
-      - *start_ab
-      - *primary_members_ok
-      - *others_members_b_ok
-      - input: { act: { by: bob, wait: "Pending.others.decision[B]@a2", outcome: reject, data: { reason: "Out of scope" } } }
-        expect:
-          - [WaitCompleted, { wait: "Pending.others.decision[B]@a2", outcome: reject, by: bob }]
-          - [TransitionFired, { transition: t_reject, activation: a2 }]
-          - [WaitCancelled, { wait: Pending.primary.decision@a2, cause: stage exit }]
-          - [StageExited, { activation: a2, mode: normal }]
-          - [StageEntered, { activation: a3, stage: Rejected, parentActivation: a1 }]
-          - [RequestClosed, { stage: Rejected }]
-      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
-        refuse: { reason: wait-not-open }
-        expect: []
-
-  - id: T6
-    name: Admin skips a domain's approval and jumps, in one turn
-    turns:
-      - *start_ac
-      - *primary_members_ok
-      - *others_members_c_ok
-      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
-        expect:
-          - [WaitCompleted, { wait: Pending.primary.decision@a2, outcome: approve, by: alice }]   # t_accept is false: others.decision[C] is open
-      - input:
-          admin:
-            by: root-admin
-            reason: "Domain C has no approvers; approved out of band, ticket OPS-1"
-            actions:
-              - { skip: "Pending.others.decision[C]@a2" }
-              - { setData: { engLead: lee } }
-              - { jump: { from: Pending, to: InDevelopment } }
-            waived: []
-        expect:
-          - [Overridden, { by: root-admin }]
-          - [WaitSkipped, { wait: "Pending.others.decision[C]@a2" }]
-          - [DataSet, { source: admin, patch: { engLead: lee } }]
-          - [StageExited, { activation: a2, mode: forced }]
-          - [StageEntered, { activation: a3, stage: InDevelopment, parentActivation: a1 }]
-          - [WaitOpened, { wait: InDevelopment.release.task@a3, assignees: ["user:lee"] }]
-
-  - id: T6b
-    name: A skip alone decides nothing and leaves the request stuck
-    turns:
-      - same-as: T6 turns 1 to 4
-      - input:
-          admin: { by: root-admin, reason: "Domain C has no approvers", actions: [ { skip: "Pending.others.decision[C]@a2" } ], waived: [] }
-        expect:
-          - [Overridden, { by: root-admin }]
-          - [WaitSkipped, { wait: "Pending.others.decision[C]@a2" }]
-          - [Faulted, { kind: stuck }]       # t_accept stays false; no obligation or call is open
-    finalState: { activeStages: [root, Pending], open: [], faulted: true }
-
-  - id: T7
-    name: Admin jumps while the directory calls are in flight
-    turns:
-      - *start_ab
-      - input:
-          admin:
-            by: root-admin
-            reason: "Sev1 hotfix"
-            actions:
-              - { setData: { engLead: lee } }
-              - { jump: { from: Pending, to: InDevelopment } }
-            waived: []
-        expect:
-          - [Overridden, { by: root-admin }]
-          - [DataSet, { source: admin, patch: { engLead: lee } }]
-          - [WaitSkipped, { wait: Pending.primary.members@a2 }]
-          - [WaitSkipped, { wait: Pending.primary.decision@a2 }]
-          - [WaitSkipped, { wait: Pending.others.members@a2 }]
-          - [WaitSkipped, { wait: "Pending.others.decision[B]@a2" }]
-          - [StageExited, { activation: a2, mode: forced }]
-          - [StageEntered, { activation: a3, stage: InDevelopment, parentActivation: a1 }]
-          - [WaitOpened, { wait: InDevelopment.release.task@a3 }]
-      - input: { callResult: { wait: Pending.primary.members@a2, outcome: ok, data: *members_a } }
-        expect:
-          - [CallResultLate, { wait: Pending.primary.members@a2, outcome: ok }]
-
-  - id: T7b
-    name: A jump without the data the target stage requires is refused
-    turns:
-      - *start_ab
-      - input:
-          admin: { by: root-admin, reason: "Sev1 hotfix", actions: [ { jump: { from: Pending, to: InDevelopment } } ], waived: [] }
-        refuse: { reason: requires-not-met, paths: [engLead] }
-        expect: []
-
-  - id: T8
-    name: A CEL error rolls the turn back and faults the request
-    turns:
-      - input: { start: { by: rita, input: { title: "Typo domain", primaryDomain: Z, otherDomains: [] } } }
-        expect:
-          - [RequestStarted, { by: rita }]
-          - [Faulted, { kind: error, element: primary.members }]    # approverGroup has no key Z
-      - input:
-          admin: { by: root-admin, reason: "Unknown domain; requester to resubmit", actions: [ { close: {} } ], waived: [] }
-        expect:
-          - [Overridden, { by: root-admin }]
-          - [RequestClosed, { by: admin }]
-    finalState: { activeStages: [], open: [], closed: true }
-===\n./design-doc.html\n===
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Workflow Platform Design</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-/* Layout idea: one reading column with a sticky section list on wide screens; tables and diagrams carry the structure. */
-:root {
-  --bg: #f5f6f8; --surface: #ffffff; --ink: #1b2330; --muted: #5d6878; --line: #d9dee6;
-  --accent: #2357c6; --accent-soft: #e7eefc;
-  --good: #1f7a4d; --good-soft: #e3f3ea; --warn: #9a6200; --warn-soft: #fbf0d9; --later: #6b4fbb; --later-soft: #f0ebfb;
-  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
-  color-scheme: light;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #12161d; --surface: #1a2029; --ink: #e6eaf0; --muted: #9aa5b5; --line: #2e3744;
-    --accent: #7aa2f7; --accent-soft: #1f2a44;
-    --good: #5cc98f; --good-soft: #17302a; --warn: #e5b45a; --warn-soft: #362b14; --later: #b9a3f5; --later-soft: #2a2340;
-    color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #12161d; --surface: #1a2029; --ink: #e6eaf0; --muted: #9aa5b5; --line: #2e3744;
-  --accent: #7aa2f7; --accent-soft: #1f2a44;
-  --good: #5cc98f; --good-soft: #17302a; --warn: #e5b45a; --warn-soft: #362b14; --later: #b9a3f5; --later-soft: #2a2340;
-  color-scheme: dark;
-}
-* { box-sizing: border-box; }
-html, body { margin: 0; }
-body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--font-body); }
-a { color: var(--accent); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-code, pre { font-family: var(--font-mono); font-size: 13px; }
-code { background: var(--accent-soft); padding: 0 4px; border-radius: 4px; }
-pre { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; line-height: 1.5; }
-pre code { background: none; padding: 0; }
-
-.wrap { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 32px; max-width: 1120px; margin: 0 auto; padding: 32px 24px 64px; }
-nav.toc { position: sticky; top: 24px; align-self: start; font-size: 13.5px; }
-nav.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-nav.toc a { color: var(--muted); text-decoration: none; display: block; padding: 2px 0; }
-nav.toc a:hover { color: var(--accent); }
-nav.toc .t { font-weight: 600; color: var(--ink); margin-bottom: 8px; }
-@media (max-width: 860px) { .wrap { grid-template-columns: 1fr; padding: 20px 16px 48px; } nav.toc { position: static; } }
-
-main { min-width: 0; }
-header.doc h1 { font-size: 28px; font-weight: 600; margin: 0 0 6px; text-wrap: balance; }
-header.doc p { margin: 0; color: var(--muted); }
-.meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 0; }
-.pill { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
-.pill.mvp { background: var(--good-soft); color: var(--good); }
-.pill.later { background: var(--later-soft); color: var(--later); }
-.pill.open { background: var(--warn-soft); color: var(--warn); }
-.pill.plain { border: 1px solid var(--line); color: var(--muted); }
-
-section { margin-top: 40px; }
-h2 { font-size: 20px; font-weight: 600; margin: 0 0 10px; padding-top: 8px; border-top: 1px solid var(--line); text-wrap: balance; }
-h3 { font-size: 15.5px; font-weight: 600; margin: 22px 0 6px; }
-p, ul, ol { max-width: 72ch; }
-ul, ol { padding-left: 20px; }
-li { margin: 3px 0; }
-.lead { font-size: 16.5px; }
-.tablewrap { overflow-x: auto; margin: 12px 0; }
-table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
-th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
-th { font-weight: 600; font-size: 13px; color: var(--muted); }
-tr:last-child td { border-bottom: 0; }
-td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.note { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 14px; margin: 12px 0; max-width: 72ch; }
-
-/* diagrams */
-.diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; margin: 12px 0; }
-.boxes { display: grid; gap: 12px; min-width: 620px; }
-.row { display: grid; gap: 12px; }
-.row.c3 { grid-template-columns: repeat(3, 1fr); }
-.row.c4 { grid-template-columns: repeat(4, 1fr); }
-.box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
-.box b { display: block; font-size: 14px; }
-.box span { color: var(--muted); }
-.box.core { border: 2px solid var(--accent); background: var(--accent-soft); }
-.box.ext { border-style: dashed; }
-.cap { font-size: 12.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 4px 0 -4px; }
-.flow { display: flex; align-items: stretch; gap: 0; min-width: 620px; }
-.flow .st { flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
-.flow .st.final { border-style: dashed; }
-.flow .st b { display: block; font-size: 14.5px; }
-.flow .st span { color: var(--muted); }
-.flow .ar { align-self: center; padding: 0 8px; color: var(--muted); font-size: 12.5px; white-space: nowrap; text-align: center; }
-.flow .ar::after { content: "→"; display: block; font-size: 18px; line-height: 1; }
-dl.gloss { display: grid; grid-template-columns: 190px 1fr; gap: 6px 16px; max-width: 86ch; }
-dl.gloss dt { font-weight: 600; }
-dl.gloss dd { margin: 0; }
-@media (max-width: 600px) { dl.gloss { grid-template-columns: 1fr; } dl.gloss dd { margin-bottom: 8px; } }
-</style>
-</head>
-<body>
-<div class="wrap">
-<nav class="toc" aria-label="Sections">
-  <div class="t">Sections</div>
-  <ol>
-    <li><a href="#summary">1. Summary</a></li>
-    <li><a href="#scope">2. Scope</a></li>
-    <li><a href="#architecture">3. Architecture</a></li>
-    <li><a href="#kernel">4. The kernel</a></li>
-    <li><a href="#change-request">5. The change request</a></li>
-    <li><a href="#people">6. People and permissions</a></li>
-    <li><a href="#definitions">7. Definitions and versions</a></li>
-    <li><a href="#integrations">8. Integrations</a></li>
-    <li><a href="#data">9. Data model</a></li>
-    <li><a href="#operations">10. Operations and cutover</a></li>
-    <li><a href="#plan">11. Plan</a></li>
-    <li><a href="#later">12. Later features</a></li>
-    <li><a href="#decisions">13. Decisions</a></li>
-    <li><a href="#open">14. Open questions</a></li>
-    <li><a href="#glossary">15. Glossary</a></li>
-  </ol>
-</nav>
-
-<main>
-<header class="doc">
-  <h1>Workflow Platform Design</h1>
-  <p>Version 3. Covers the first release and what it must leave room for.</p>
-  <div class="meta">
-    <span class="pill mvp">MVP: change request</span>
-    <span class="pill plain">Next.js · Node · Postgres</span>
-    <span class="pill plain">Kernel spec v2.7</span>
-  </div>
-</header>
-
-<section id="summary">
-  <h2>1. Summary</h2>
-  <p class="lead">We are rebuilding the Change Management intake as the first workflow on a small, generic workflow engine. The first release ships only that workflow, at parity with the existing product, with the workflow part made configurable.</p>
-  <ul>
-    <li><strong>The engine runs a small kernel:</strong> stages, transitions, waits and data writes. Everything an owner configures, such as an approval, expands into those parts.</li>
-    <li><strong>Each request has an append-only history,</strong> kept forever, that is the source of truth. The engine records its decisions as events, so replaying a history never re-runs workflow logic.</li>
-    <li><strong>Definitions are data,</strong> published through an API. A request stays on the version it started on.</li>
-    <li><strong>Later workflows shaped the permanent parts</strong> (event shapes and IDs) but are not built. Five more use cases are recorded in the use cases doc.</li>
-  </ul>
-  <div class="note">
-    This doc is the overview. The reference material lives in the <code>workflow-platform</code> folder:
-    <code>kernel-spec.md</code> (the kernel, in full), <code>expansion-battery.md</code> (workflows expanded on paper to test the kernel), and <code>test-cases/</code> (the change request as test data). Version 2.1 of this doc, with the earlier design and the detail for later use cases, is in this page's version history.
-  </div>
-</section>
-
-<section id="scope">
-  <h2>2. Scope</h2>
-  <div class="tablewrap"><table>
-    <thead><tr><th>In the first release</th><th>Not in the first release</th></tr></thead>
-    <tbody>
-      <tr><td>The change request workflow, at parity with the existing product (with intentional exceptions where it is bad)</td><td>The five later use cases: tech debt initiatives, architecture review, metrics recertification, domain routing with Jira, metadata changes</td></tr>
-      <tr><td>Multi-domain approval: every domain's approvers approve; the primary domain's approver picks the eng lead</td><td>Updating a request in flight to a newer definition (migrations)</td></tr>
-      <tr><td>Publishing a definition through the API and an admin page that accepts JSON</td><td>A visual workflow editor, and composites beyond Approval and Task</td></tr>
-      <tr><td>Admin override and break-glass access</td><td>Timers, child requests, date-triggered starts</td></tr>
-      <tr><td>Notifications through the existing email and Slack service</td><td>Attachments (no file storage yet)</td></tr>
-      <tr><td>The form renderer for the intake form</td><td>Importing legacy requests</td></tr>
-    </tbody>
-  </table></div>
-  <p>Scale is small: about one request every 10 seconds at most, across all future apps. Simplicity and correctness matter more than throughput.</p>
-  <h3>Why build</h3>
-  <p>The existing Change Management product is ours; this is its refactor. No product we reviewed covers the fixed needs without adding a JVM or a cluster to run: definitions as data published without a deployment, a permanent audit history as the source of truth, authorization checked when a person acts, and admin overrides recorded as skipped. Open-source BPMN engines (Operaton, Flowable) come closest and would still leave those four to build. Durable-execution engines (Temporal and similar) define workflows in code and do not keep history forever.</p>
-</section>
-
-<section id="architecture">
-  <h2>3. Architecture</h2>
-  <div class="diagram">
-    <div class="boxes">
-      <div class="cap">Our app</div>
-      <div class="row c3">
-        <div class="box"><b>Change Management pages</b><span>Request list, request page, my action items, intake form. Uses the company component library.</span></div>
-        <div class="box"><b>Admin pages</b><span>Publish a definition (JSON), inspect a request's history, override.</span></div>
-        <div class="box core"><b>Engine API</b><span>Start, act, admin turn, publish. One transaction per input.</span></div>
-      </div>
-      <div class="cap">Background workers</div>
-      <div class="row c3">
-        <div class="box"><b>Call dispatcher</b><span>Delivers pending calls at least once; a reconciler re-queues stalled ones.</span></div>
-        <div class="box"><b>Notifier</b><span>Reads committed events in order and applies the definition's notification rules.</span></div>
-        <div class="box"><b>Projection</b><span>Keeps the request table and action-item lists up to date from events.</span></div>
-      </div>
-      <div class="cap">Storage and outside systems</div>
-      <div class="row c3">
-        <div class="box core"><b>Postgres</b><span>Events, definitions, request table, pending calls, attempts log.</span></div>
-        <div class="box ext"><b>User directory</b><span>Group membership and people search.</span></div>
-        <div class="box ext"><b>Email and Slack service</b><span>Already in the codebase.</span></div>
-      </div>
-    </div>
-  </div>
-  <p>One engine hosts several apps. Each app is a <em>namespace</em> with its own pages and its own action-item list; apps share the engine and its tables, separated by a namespace column. There is no inbox shared across apps.</p>
-  <p>The UI is layered so later apps can reuse it: a headless client for the API, a set of UI components kept as a folder inside the app for now, and the Change Management pages on top.</p>
-</section>
-
-<section id="kernel">
-  <h2>4. The kernel</h2>
-  <p>The kernel is the small set of parts the engine executes. The full rules are in <code>kernel-spec.md</code>.</p>
-  <div class="tablewrap"><table>
-    <thead><tr><th>Part</th><th>What it is</th><th>First release</th></tr></thead>
-    <tbody>
-      <tr><td><strong>Stage</strong></td><td>A named scope. The root stage is always active, and exactly one child stage is active. Entering a stage opens its waits; leaving it cancels the ones still open. A final stage closes the request.</td><td>Root plus one level</td></tr>
-      <tr><td><strong>Transition</strong></td><td>A condition and a target stage. The condition is checked against recorded state after every input; there are no trigger events. It can write data when it fires.</td><td>Yes</td></tr>
-      <tr><td><strong>Wait</strong></td><td>The only thing that blocks. It opens, then closes once as completed, cancelled or skipped. A <em>person</em> wait is closed by an authorised person submitting an outcome and data. A <em>call</em> wait is closed by a connector's result.</td><td>Person and call</td></tr>
-      <tr><td><strong>Set</strong></td><td>A write to the request's data document, on a transition, at start, or by an admin.</td><td>Yes</td></tr>
-      <tr><td><strong>For each</strong></td><td>Opens one person wait per item of a list fixed when the stage is entered.</td><td>On person waits</td></tr>
-    </tbody>
-  </table></div>
-
-  <h3>How an input is processed</h3>
-  <ol>
-    <li>One input (a start, a person acting, a call result, an admin action) is one <em>turn</em>, under a per-request lock, in one database transaction.</li>
-    <li>The input is validated. A refused attempt writes nothing to history; it goes to a separate attempts log.</li>
-    <li><code>decide</code> reads the definition, evaluates conditions and writes events that spell out every consequence: which transition fired and what it read, which stage was entered, which waits opened with which resolved parameters.</li>
-    <li><code>evolve</code> folds events into state. Replay uses only <code>evolve</code>: it never evaluates a condition and never reads the definition.</li>
-  </ol>
-  <p>The cost of recording decisions is that a bug in <code>decide</code> is recorded as fact. It is repaired by an admin turn, never by rewriting history.</p>
-
-  <h3>Rules that shape everything else</h3>
-  <ul>
-    <li><strong>No unsolicited input.</strong> Every inbound fact closes a wait the engine opened. There are no signals or correlation keys.</li>
-    <li><strong>Joins are conditions.</strong> "All approved" or "any rejected" is an expression over the waits in the stage. An open wait always has a readable status, so these expressions are safe.</li>
-    <li><strong>Results belong to one entry of a stage.</strong> Re-entering a stage gives fresh waits. Anything that must persist is written to data.</li>
-    <li><strong>No clock.</strong> Each event carries its timestamp, and that is the only time the engine knows.</li>
-    <li><strong>Errors never count as false.</strong> A failed condition rolls the turn back and marks the request faulted until an admin acts.</li>
-    <li><strong>A stuck check runs after every turn.</strong> An open request with no open obligation and no open call is flagged for admins.</li>
-  </ul>
-
-  <h3>Events</h3>
-  <p>Every event carries the request ID, a sequence number, a timestamp, the turn it belongs to, a schema version and the engine build. The vocabulary is provisional until a second workflow has been built on it.</p>
-  <div class="tablewrap"><table>
-    <thead><tr><th>Kind</th><th>Events</th></tr></thead>
-    <tbody>
-      <tr><td>Inputs from outside</td><td><code>RequestStarted</code>, <code>WaitCompleted</code>, <code>CallResultLate</code>, <code>Overridden</code></td></tr>
-      <tr><td>Decisions the engine recorded</td><td><code>TransitionFired</code>, <code>StageEntered</code>, <code>StageExited</code>, <code>WaitOpened</code>, <code>WaitCancelled</code>, <code>WaitSkipped</code>, <code>DataSet</code>, <code>Faulted</code>, <code>RequestClosed</code>, <code>RequestReopened</code></td></tr>
-    </tbody>
-  </table></div>
-  <p>A few fields exist only so later features need no change to old history: a stage entry records its parent entry, a wait ID carries a sequence number, and a request can record the request that started it. Each points to a case in the expansion battery.</p>
-</section>
-
-<section id="change-request">
-  <h2>5. The change request</h2>
-  <p>A request has one primary domain and zero or more other domains, taken from the form. It only moves forward.</p>
-  <div class="diagram">
-    <div class="flow">
-      <div class="st"><b>Pending</b><span>One approval per domain. The primary domain's approver picks the eng lead to approve. Each approval's directory call records who can approve.</span></div>
-      <div class="ar">all approve</div>
-      <div class="st"><b>In development</b><span>The eng lead marks the request released.</span></div>
-      <div class="ar">released</div>
-      <div class="st final"><b>Released</b><span>Final.</span></div>
-    </div>
-    <p style="margin:12px 0 0;font-size:13.5px;color:var(--muted)">Any one rejection in Pending moves the request to <strong>Rejected</strong> (final) and cancels the approvals still open.</p>
-  </div>
-  <ul>
-    <li><strong>Submission never blocks.</strong> If a domain has nobody able to approve, the request still enters Pending and waits. A notification rule alerts the workflow admins from the recorded directory result.</li>
-    <li><strong>Requesters cannot approve their own request.</strong> Group membership is checked when the person acts, and the lookup is recorded with the approval.</li>
-    <li><strong>An admin can skip one domain's approval,</strong> but a skip never counts as an approval. To move the request on, the admin also jumps it forward and supplies the eng lead if nobody picked one.</li>
-  </ul>
-  <h3>Composites</h3>
-  <p>The definition is written with two composites. Each is code in the repository, has a version, and expands into kernel parts when the definition is published. History never names a composite; the published definition records which composite, version and parameters each element came from. An expanded element's ID is the composite instance's ID plus a local name (<code>primary.decision</code>, <code>primary.members</code>, <code>release.task</code>), and it stays the same across composite versions when the element means the same thing. That is what lets a later migration find the approval an old event belongs to.</p>
-  <div class="tablewrap"><table>
-    <thead><tr><th>Composite</th><th>Parameters</th><th>Expands to</th></tr></thead>
-    <tbody>
-      <tr><td><strong>Approval</strong></td><td><code>group</code>; <code>over</code> (optional list, one approval per item); <code>approveData</code>; <code>allowRequester</code> (default false); outcome names (default approve and reject)</td><td>A person wait marked as an obligation, the rule that the requester cannot act, the directory membership call, and the notification rule for "nobody is able to approve".</td></tr>
-      <tr><td><strong>Task</strong></td><td><code>assignee</code>; <code>outcomes</code> (default done); <code>doneData</code></td><td>One person wait marked as an obligation.</td></tr>
-    </tbody>
-  </table></div>
-  <ul>
-    <li><strong>An approval does not own a transition.</strong> It exposes two conditions, <code>approved</code> and <code>rejected</code>, and the workflow's own transitions decide what each one does. With <code>over</code>, <code>approved</code> means every item is approved and <code>rejected</code> means any item is rejected.</li>
-    <li><strong>The change request uses two approvals and one task:</strong> the primary domain's approval (with the eng lead as its approval data), an approval over the other domains, and the eng lead's release task.</li>
-    <li><strong>The new-task notification</strong> is a default rule on every definition, not a composite.</li>
-  </ul>
-  <h3>Example composite: domain approvals</h3>
-  <p>A third composite is built as a worked example of how to write one. It is a fork of Approval for a primary group plus other groups, and it is the route to take when a workflow needs something Approval's parameters do not cover: fork it, do not add parameters. The change request does not use it in the first release.</p>
-  <ul>
-    <li><strong>Parameters:</strong> <code>primaryGroup</code>; <code>otherGroups</code> (a list); <code>primaryApproveData</code>; <code>allowRequester</code> (default false); outcome names.</li>
-    <li><strong>Expands to:</strong> one directory call for all the groups (<code>members</code>), the primary's person wait (<code>primary</code>), one person wait per other group (<code>others</code>), and one "nobody is able to approve" rule (<code>noApprover</code>). Each ID is prefixed with the instance's ID.</li>
-    <li><strong>Exposes</strong> the same <code>approved</code> and <code>rejected</code> conditions as Approval, and declares the same kind, <code>approval</code>, so pages and reports treat it as an approval.</li>
-    <li><strong>What it shows a developer:</strong> derived element IDs, a version, the stored-expansion build test, a shared kind, and exposed conditions. Compared with two Approval instances it makes one directory call and sends one alert per request.</li>
-  </ul>
-  <p>The definition and the happy-path events are in section 9 of the kernel spec. Ten cases (happy path, no other domains, no eligible approver, refused attempts, rejection, admin skip and jump, a jump during an in-flight call, an expression error) are written as test data in <code>test-cases/c1-change-request.yaml</code>.</p>
-  <p><span class="pill open">To confirm</span> Three assumptions about the existing product: approvals for all domains run in parallel; one rejection rejects the whole request; a person in two domains' groups may approve for both.</p>
-</section>
-
-<section id="people">
-  <h2>6. People and permissions</h2>
-  <ul>
-    <li><strong>Who may act</strong> is decided when they act: the engine looks up the actor's group memberships, checks them against the wait's assignees and its rule, and records the lookup as evidence.</li>
-    <li><strong>Who is being asked</strong> is recorded when the wait opens, as user and group references.</li>
-    <li><strong>My action items</strong> are the open person waits marked as obligations whose assignees name me or a group I belong to now. Each app has its own list.</li>
-    <li><strong>Viewing</strong> follows roles on the request: requester, approver, eng lead. Someone who used to hold a role keeps view access only.</li>
-  </ul>
-  <h3>Admin turns</h3>
-  <p>An admin action is one recorded event followed by its consequences. An admin can skip one wait, jump to a stage, set data, disable a transition for one request, clear a fault, and close or reopen a request. Jumping into a stage requires the admin to supply, or explicitly waive, the data that stage needs. What was skipped is recorded as skipped, never as done.</p>
-  <h3>Break-glass</h3>
-  <p>The dev team holds standing super-admin access so a production problem never waits on a deployment or an entitlement request. A break-glass user can do anything an admin can, including on their own requests. Safeguards come from accountability (a required reason, a time-boxed session, a team alert, an after-the-fact review list), not from hard-coded limits. The first super-admins are seeded by a database migration.</p>
-</section>
-
-<section id="definitions">
-  <h2>7. Definitions and versions</h2>
-  <ul>
-    <li>A definition is a JSON document stored in the platform database and published through the API. There is no server CLI access, so the admin page that accepts JSON is the publishing tool.</li>
-    <li>A published version is immutable. <strong>A request stays on the version it started on, forever.</strong></li>
-    <li>A saved draft of the intake form is not a request yet. It is checked against the latest version when submitted.</li>
-    <li>Conditions and computed values use CEL. Approver routing by domain is a CEL lookup, not a separate decision-table feature.</li>
-    <li>Publishing runs checks: expressions type-check, data is read only where it exists, every stage can reach a final stage, and every outcome leads somewhere. "Can never get stuck" cannot be proven in general; the runtime stuck check is the backstop.</li>
-    <li>The first release has two composites, Approval and Task, and one example composite, all written as code (section 5). Changing what a composite expands to requires a new composite version; a build test compares each expansion with a stored copy and fails otherwise.</li>
-  </ul>
-  <p>The definition format and its CEL environment are a second long-lived contract: the engine must be able to run a version for as long as a request on it is open.</p>
-</section>
-
-<section id="integrations">
-  <h2>8. Integrations</h2>
-  <div class="tablewrap"><table>
-    <thead><tr><th>System</th><th>How it connects</th></tr></thead>
-    <tbody>
-      <tr><td>User directory</td><td>A call wait reads group members. The act-time membership check reads it too. The people picker for the eng lead searches it.</td></tr>
-      <tr><td>Email and Slack</td><td>The notifier consumes committed events and applies the definition's notification rules, delivering through the existing service. A sent notification is not part of a request's history.</td></tr>
-      <tr><td>Other systems, later</td><td>A call wait through a connector. A connector must honour the idempotency key and must never report "don't know" as a failure.</td></tr>
-    </tbody>
-  </table></div>
-  <p>A call's result is recorded in history when it arrives, so replay never calls out. A result that arrives after its wait was cancelled is still recorded, as a late result that no condition can see.</p>
-  <p><strong>Forms.</strong> The first release renders the intake form itself. Using the internal form creator app through its API remains the preferred long-term route and has not been evaluated.</p>
-</section>
-
-<section id="data">
-  <h2>9. Data model</h2>
-  <div class="tablewrap"><table>
-    <thead><tr><th>Table</th><th>Holds</th><th>Notes</th></tr></thead>
-    <tbody>
-      <tr><td><code>events</code></td><td>Every request's history</td><td>Append-only. The source of truth.</td></tr>
-      <tr><td><code>definitions</code></td><td>Published definition versions</td><td>Immutable rows.</td></tr>
-      <tr><td><code>requests</code></td><td>Current state of each request</td><td>Rebuildable from events. Data is one jsonb column with a general index, so publishing never changes the schema. Stores the active stages as a set, the readable ID, and a reserved legacy ID.</td></tr>
-      <tr><td><code>open_waits</code></td><td>Open waits and their assignees</td><td>Rebuildable. Feeds action-item lists.</td></tr>
-      <tr><td><code>pending_calls</code></td><td>Calls waiting for delivery</td><td>Written in the same transaction as the event that opened the call.</td></tr>
-      <tr><td><code>attempts_log</code></td><td>Refused attempts</td><td>Outside history.</td></tr>
-      <tr><td><code>super_admins</code></td><td>Break-glass membership and sessions</td><td>Seeded by migration.</td></tr>
-    </tbody>
-  </table></div>
-  <p>All tables carry the namespace. History is kept forever; there are no snapshots, because replay is a cheap fold over a few dozen events.</p>
-</section>
-
-<section id="operations">
-  <h2>10. Operations and cutover</h2>
-  <ul>
-    <li><strong>Faults.</strong> A faulted request shows in an admin list with the element and error. It keeps recording inputs and resumes after an admin turn.</li>
-    <li><strong>Stuck requests.</strong> Flagged automatically after any turn that leaves nothing open.</li>
-    <li><strong>Calls.</strong> Delivered by a Postgres job queue that can enqueue inside the same transaction (Graphile Worker or pg-boss). A reconciler re-queues any open call with no delivery in flight.</li>
-    <li><strong>Request inspector.</strong> An admin page showing a request's events, including which transition fired and the values it read.</li>
-  </ul>
-  <h3>Cutover</h3>
-  <ul>
-    <li>Requests already in flight finish in the existing product. New requests start in the new one.</li>
-    <li>Readable IDs in the new system start above the legacy maximum, so the two never collide.</li>
-    <li>Importing legacy requests is reconsidered after release. The request table reserves a legacy ID so it needs no schema change.</li>
-  </ul>
-</section>
-
-<section id="plan">
-  <h2>11. Plan</h2>
-  <div class="tablewrap"><table>
-    <thead><tr><th></th><th>Milestone</th><th>Done when</th></tr></thead>
-    <tbody>
-      <tr><td class="n">M0</td><td>Parity checklist</td><td>The existing product's behaviours are listed from its code, each marked keep or drop.</td></tr>
-      <tr><td class="n">M1</td><td>Walking skeleton</td><td>The engine passes test case T1, and the request table rebuilds from events.</td></tr>
-      <tr><td class="n">M2</td><td>Change request behaviour</td><td>The Approval and Task composites are built, plus the domain-approvals example, each with a version and the stored-expansion build test. All cases in <code>test-cases/</code> pass, plus cases added from the parity checklist.</td></tr>
-      <tr><td class="n">M3</td><td>The app</td><td>Intake form, request page, action items and admin pages work end to end.</td></tr>
-      <tr><td class="n">M4</td><td>Operability</td><td>A staged incident is fixed through the admin pages alone, with no server access.</td></tr>
-      <tr><td class="n">M5</td><td>Cutover</td><td>New requests start in the new system.</td></tr>
-    </tbody>
-  </table></div>
-  <p>The kernel is a small share of the work. Most of the effort is the form renderer and app, integration with the existing codebase, parity, operability and cutover.</p>
-</section>
-
-<section id="later">
-  <h2>12. Later features</h2>
-  <p>Each has a short reserved rule in the kernel spec and a paper case in the expansion battery. None is built in the first release.</p>
-  <div class="tablewrap"><table>
-    <thead><tr><th>Feature</th><th>What it adds</th><th>Needed by</th></tr></thead>
-    <tbody>
-      <tr><td><span class="pill later">Later</span> Child requests</td><td>Start another workflow, optionally wait for it, and let it outlive the stage that started it. Also the answer for a multi-step task inside a stage.</td><td>Tech debt initiatives, architecture review</td></tr>
-      <tr><td><span class="pill later">Later</span> Timer waits</td><td>Make something happen when a time arrives.</td><td>Deadlines, reminders</td></tr>
-      <tr><td><span class="pill later">Later</span> Act-time gates</td><td>Named checks per outcome, with messages, run when a person acts. They can read the time of the attempt.</td><td>Metric change control</td></tr>
-      <tr><td><span class="pill later">Later</span> Repeatable waits</td><td>An action a person can repeat within one stage entry, such as ticking a box or editing a field. Each use writes data.</td><td>Checklists that can be un-ticked</td></tr>
-      <tr><td><span class="pill later">Later</span> In-flight updates</td><td>Moving a request to a newer definition version.</td><td>Architecture review</td></tr>
-      <tr><td><span class="pill later">Later</span> Scheduling</td><td>Date-triggered starts and recurring duties, possibly as a separate "obligations" feature.</td><td>Metrics recertification</td></tr>
-      <tr><td><span class="pill later">Later</span> Workflow editor and more composites</td><td>Owners configure workflows in a UI from ready-made parts.</td><td>Every later app</td></tr>
-    </tbody>
-  </table></div>
-  <p>The metric change-control requirements were expanded on paper as a second workflow. They fit the model with no new event type; they need act-time gates and child requests, and one loop (revise and re-approve) is a known weak spot to revisit when that workflow is built.</p>
-</section>
-
-<section id="decisions">
-  <h2>13. Decisions</h2>
-  <div class="tablewrap"><table>
-    <thead><tr><th>#</th><th>Decision</th><th>Replaces</th></tr></thead>
-    <tbody>
-      <tr><td class="n">1</td><td>Build a small engine; do not adopt a product.</td><td></td></tr>
-      <tr><td class="n">2</td><td>Kernel of stages, transitions, waits and Set. Approvals and forms are composites.</td><td>Separate node types for approval, task, action, branch and subflow</td></tr>
-      <tr><td class="n">3</td><td>History is the source of truth. The engine records its decisions; replay is a fold.</td><td>Replaying inputs through a version-gated reducer; snapshots; state hashes</td></tr>
-      <tr><td class="n">4</td><td>No unsolicited input; conditions read recorded state.</td><td>Events matched to waiters by correlation key</td></tr>
-      <tr><td class="n">5</td><td>Joins are CEL conditions.</td><td>A table of join policies</td></tr>
-      <tr><td class="n">6</td><td>External data enters history as call results and act-time evidence.</td><td>Prefetching data before each engine run</td></tr>
-      <tr><td class="n">7</td><td>CEL for all conditions and computed values.</td><td></td></tr>
-      <tr><td class="n">8</td><td>Definitions are data in the database, published through the API.</td><td></td></tr>
-      <tr><td class="n">9</td><td>A request stays on its definition version forever. Drafts follow the latest version at submit.</td><td>Configurable change policies</td></tr>
-      <tr><td class="n">10</td><td>One engine, many apps, separated by namespace. No shared inbox.</td><td></td></tr>
-      <tr><td class="n">11</td><td>An empty approver group never blocks submission. The alert is a notification rule.</td><td>Routing and alerting stages in the flow</td></tr>
-      <tr><td class="n">12</td><td>Admin override records what was skipped; a skip never counts as done.</td><td></td></tr>
-      <tr><td class="n">13</td><td>Break-glass can act on its own requests; safeguards are accountability, not hard limits.</td><td></td></tr>
-      <tr><td class="n">14</td><td>Notifications are a consumer of the event stream, outside history.</td><td>Notifications as engine effects</td></tr>
-      <tr><td class="n">15</td><td>Calls are delivered from a Postgres job queue in the same transaction as their event.</td><td></td></tr>
-      <tr><td class="n">16</td><td>Stages nest one level. A multi-step task inside a stage is a child request.</td><td>A node graph inside each stage</td></tr>
-      <tr><td class="n">17</td><td>No attachments in the first release.</td><td></td></tr>
-      <tr><td class="n">18</td><td>Cutover by draining the existing product; import later if it proves easy.</td><td></td></tr>
-      <tr><td class="n">19</td><td>The spec covers every known use case; only the first release is built. Test cases as data are the engine's first tests.</td><td></td></tr>
-    </tbody>
-  </table></div>
-</section>
-
-<section id="open">
-  <h2>14. Open questions</h2>
-  <ul>
-    <li>Do the three approval assumptions in section 5 match the existing product?</li>
-    <li>Which directory API backs group membership and the people picker?</li>
-    <li>After what date are requests still open in the existing product imported or closed?</li>
-    <li>Does the existing product have saved drafts, SLA reminders or reports that must carry over? The parity checklist (M0) answers this.</li>
-    <li>Which JavaScript CEL library? It needs a short trial for conformance and custom functions.</li>
-    <li>Approvers editing a request's domain: the existing behaviour has known problems and is set aside for now.</li>
-    <li>Erasing personal data from a history that is kept forever: set aside for now.</li>
-  </ul>
-</section>
-
-<section id="glossary">
-  <h2>15. Glossary</h2>
-  <dl class="gloss">
-    <dt>Request</dt><dd>One running instance of a workflow, such as a single change request.</dd>
-    <dt>Definition</dt><dd>The published description of a workflow: its stages, waits, transitions and notification rules.</dd>
-    <dt>Kernel</dt><dd>The small set of parts the engine executes: stage, transition, wait, Set.</dd>
-    <dt>Composite</dt><dd>Something an owner configures, such as an approval, that expands into kernel parts when published.</dd>
-    <dt>Stage</dt><dd>Where a request is. Shown to users as its status.</dd>
-    <dt>Activation</dt><dd>One entry of a stage. Re-entering a stage creates a new activation with fresh waits.</dd>
-    <dt>Wait</dt><dd>Something the request is waiting on: a person's action or a call's result.</dd>
-    <dt>Obligation / option</dt><dd>A person wait that someone is being asked to do, versus one they may do. Only obligations appear in action-item lists.</dd>
-    <dt>Transition</dt><dd>A condition that, when true, moves the request to another stage.</dd>
-    <dt>Turn</dt><dd>The processing of one input, in one database transaction.</dd>
-    <dt>History</dt><dd>The append-only list of a request's events. The source of truth.</dd>
-    <dt>Decide / evolve</dt><dd><code>decide</code> works out what an input causes and records it as events. <code>evolve</code> applies events to state and is all that replay uses.</dd>
-    <dt>Replay</dt><dd>Rebuilding a request's state by applying its events in order.</dd>
-    <dt>Call</dt><dd>A request to an outside system through a connector, with a key that makes repeats safe.</dd>
-    <dt>Idempotency key</dt><dd>An identifier sent with a call so the outside system can recognise a repeat and not act twice.</dd>
-    <dt>Fault</dt><dd>A request the engine has flagged for an admin: an expression failed, or nothing is left open.</dd>
-    <dt>Admin turn</dt><dd>An admin's recorded intervention: skip, jump, set data, close or reopen.</dd>
-    <dt>Break-glass</dt><dd>Standing super-admin access for the dev team, for emergencies.</dd>
-    <dt>Namespace</dt><dd>One workflow app on the shared engine, with its own pages and lists.</dd>
-    <dt>CEL</dt><dd>Common Expression Language, used for conditions and computed values.</dd>
-    <dt>Expansion battery</dt><dd>Workflows expanded on paper into kernel parts and events, to test that the kernel can express them.</dd>
-    <dt>Insurance field</dt><dd>A field recorded now only so a later feature needs no change to old history.</dd>
-    <dt>Drain</dt><dd>Letting in-flight requests finish in the old system while new ones start in the new one.</dd>
-  </dl>
-</section>
-</main>
-</div>
-</body>
-</html>
-===\n./instage-test/brief.md\n===
+===\n./research/instage-test/brief.md\n===
 # In-stage interactions: paper test brief
 
 ## Background
@@ -1000,7 +57,7 @@ You may add patterns you think are missing.
 The single most important output: any pattern where a model, or a later switch between models, would require a **history** change beyond what spec v2.4 already records. Be exact about which event or field.
 
 Be calibrated. A criticism you cannot back with a concrete sketch should be dropped or marked as a hunch. Also list what worked without trouble.
-===\n./instage-test/model-D.md\n===
+===\n./research/instage-test/model-D.md\n===
 # Model D (data-driven): paper test
 
 ## 1. The design
@@ -1145,7 +202,7 @@ No direction requires rewriting old events. The cost is always "carry two encodi
 - Internals: the compiler, and optionally hiding the per-write `WaitOpened`.
 
 So H then D is the cheapest switch and D then H the next. The asymmetry is one event type. If the team wants D's authoring model with the least history risk, ship D's `writes` syntax over H's events and accept three events per write instead of one.
-===\n./instage-test/adversary.md\n===
+===\n./research/instage-test/adversary.md\n===
 # Adversary report: "the v2.4 history is neutral between D, E and H"
 
 ## Verdict
@@ -1233,7 +290,7 @@ If the completion also enables a transition out of the stage, the brief's order 
 
 - Recording every payload twice (`WaitCompleted.data` and `DataSet.patch`) doubles the surface for the personal-data erasure problem that section 10 sets aside.
 - A reader cannot tell from `WaitOpened` alone that a wait is repeatable; nothing I tried needed it.
-===\n./instage-test/model-H.md\n===
+===\n./research/instage-test/model-H.md\n===
 # Model H (hybrid): paper test against kernel spec v2.4
 
 ## Summary
@@ -1356,7 +413,7 @@ Relaxing later: an opt-in, edge-triggered form ("fires on each completion of wai
 ## What worked without trouble
 
 Wait IDs, per-item sequences, replay without the definition, the attempts log, audit of every occurrence, and `may` reading data at act time.
-===\n./instage-test/model-E.md\n===
+===\n./research/instage-test/model-E.md\n===
 # Model E (event-driven): paper test against kernel spec v2.4
 
 ## Summary
@@ -1487,28 +544,764 @@ This switch is cheap only if three things are fixed in H now:
 3. H's wait Set is evaluated per kept input, in order, when a fault clears.
 
 If H's `evolve` assumes a close-once wait always has `seq 1`, patterns 4 and 6 become a replay change later. That is the one expensive trap I found.
-===\n./kernel-spec.md\n===
-# Workflow engine kernel: spec v2.7
+===\n./composites/composites.md\n===
+# Composites (first release)
 
-Status: proposal. The design doc summarises it; this file is the reference.
+A composite is something a workflow author configures. It is code in the repository, has a version, and expands into kernel parts when a definition is published. The engine never sees a composite, only its expansion. The rules every composite must follow (derived element IDs, recorded name, version and parameters, a version bump on any expansion change) are in `kernel/kernel-spec.md`, section 7.
+
+Below, `x` is the instance ID the author gives. Element IDs are `x.<local name>`, prefixed with the stage in the published definition.
+
+## Approval (kind: approval)
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `group` | required | The approver group. With `over`, an expression that reads `item`. |
+| `over` | none | A list. One approval per item. |
+| `approveData` | `{}` | Schema of the data an approver must give to approve. |
+| `allowRequester` | false | Whether the requester may decide. |
+| `outcomes` | approve, reject | Outcome names. |
+| `optional` | false | The decision is recorded but nothing has to wait for it. |
+| `notify` | false | Only for an optional approval: tell the assignees when it opens. |
+
+Expands to:
+
+- `x.decision`: a person wait. Assignees are the group. `may: actor != request.by` unless `allowRequester`. Outcomes are approve (with `approveData`) and reject (with a reason). `role: obligation`, or `option` when `optional`. With `over`, `foreach` over the list.
+- `x.members`: a directory `membersOf` read for the group, or for every item's group with `over`. Declared `onFailure: outcome`, because the check is advisory: a failed lookup must not stop the request, and the `noApprover` rule reports it. Not emitted when `optional`.
+- Rule `x.noApprover`: on `WaitCompleted x.members`, alert the workflow admins when the call failed or a group has nobody able to approve. Not emitted when `optional`.
+- Rule `x.notify`: on `WaitOpened x.decision`, tell the assignees. Emitted only when `optional` and `notify`.
+
+Exposes to the workflow's transitions:
+
+- `x.approved`: the decision is approve. With `over`: every item is approved (true for an empty list).
+- `x.rejected`: the decision is reject. With `over`: any item is rejected.
+- `x.data`: the approve data (not with `over`).
+
+An approval owns no transition. The workflow decides what approved and rejected do, and a workflow may simply not read them.
+
+## Task (kind: task)
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `assignee` | required | A user or group. |
+| `outcomes` | done | Outcome names. |
+| `doneData` | `{}` | Schema of the data given on completion. |
+
+Expands to `x.task`: one person wait, `role: obligation`.
+
+## Default notification rule
+
+Every definition gets the rule `n_task`: on `WaitOpened`, when the wait is a person wait with `role: obligation`, tell the assignees. It is not a composite.
+
+## Example composite: DomainApprovals (kind: approval)
+
+Built as a worked example of how to write a composite. It is a fork of Approval for a primary group plus other groups. When a workflow needs something Approval's parameters do not cover, fork it; do not add parameters. Forks declare the same `kind`, so pages and reports treat them alike. The change request does not use this composite in the first release.
+
+- Parameters: `primaryGroup`; `otherGroups` (a list); `primaryApproveData`; `allowRequester` (default false); `outcomes`.
+- Expands to: `x.members` (one directory call for all the groups), `x.primary` (the primary's person wait), `x.others` (one person wait per other group), and one rule `x.noApprover`.
+- Exposes `x.approved` and `x.rejected`, as Approval does.
+- Compared with two Approval instances, it makes one directory call and sends one alert per request.
+===\n./design-doc.html\n===
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workflow Platform Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Layout idea: one reading column with a sticky section list on wide screens; tables and diagrams carry the structure. */
+:root {
+  --bg: #f5f6f8; --surface: #ffffff; --ink: #1b2330; --muted: #5d6878; --line: #d9dee6;
+  --accent: #2357c6; --accent-soft: #e7eefc;
+  --good: #1f7a4d; --good-soft: #e3f3ea; --warn: #9a6200; --warn-soft: #fbf0d9; --later: #6b4fbb; --later-soft: #f0ebfb;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161d; --surface: #1a2029; --ink: #e6eaf0; --muted: #9aa5b5; --line: #2e3744;
+    --accent: #7aa2f7; --accent-soft: #1f2a44;
+    --good: #5cc98f; --good-soft: #17302a; --warn: #e5b45a; --warn-soft: #362b14; --later: #b9a3f5; --later-soft: #2a2340;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12161d; --surface: #1a2029; --ink: #e6eaf0; --muted: #9aa5b5; --line: #2e3744;
+  --accent: #7aa2f7; --accent-soft: #1f2a44;
+  --good: #5cc98f; --good-soft: #17302a; --warn: #e5b45a; --warn-soft: #362b14; --later: #b9a3f5; --later-soft: #2a2340;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--font-body); }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code, pre { font-family: var(--font-mono); font-size: 13px; }
+code { background: var(--accent-soft); padding: 0 4px; border-radius: 4px; }
+pre { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+
+.wrap { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 32px; max-width: 1120px; margin: 0 auto; padding: 32px 24px 64px; }
+nav.toc { position: sticky; top: 24px; align-self: start; font-size: 13.5px; }
+nav.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+nav.toc a { color: var(--muted); text-decoration: none; display: block; padding: 2px 0; }
+nav.toc a:hover { color: var(--accent); }
+nav.toc .t { font-weight: 600; color: var(--ink); margin-bottom: 8px; }
+@media (max-width: 860px) { .wrap { grid-template-columns: 1fr; padding: 20px 16px 48px; } nav.toc { position: static; } }
+
+main { min-width: 0; }
+header.doc h1 { font-size: 28px; font-weight: 600; margin: 0 0 6px; text-wrap: balance; }
+header.doc p { margin: 0; color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 0; }
+.pill { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
+.pill.mvp { background: var(--good-soft); color: var(--good); }
+.pill.later { background: var(--later-soft); color: var(--later); }
+.pill.open { background: var(--warn-soft); color: var(--warn); }
+.pill.plain { border: 1px solid var(--line); color: var(--muted); }
+
+section { margin-top: 40px; }
+h2 { font-size: 20px; font-weight: 600; margin: 0 0 10px; padding-top: 8px; border-top: 1px solid var(--line); text-wrap: balance; }
+h3 { font-size: 15.5px; font-weight: 600; margin: 22px 0 6px; }
+p, ul, ol { max-width: 72ch; }
+ul, ol { padding-left: 20px; }
+li { margin: 3px 0; }
+.lead { font-size: 16.5px; }
+.tablewrap { overflow-x: auto; margin: 12px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { font-weight: 600; font-size: 13px; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.note { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 14px; margin: 12px 0; max-width: 72ch; }
+
+/* diagrams */
+.diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; margin: 12px 0; }
+.boxes { display: grid; gap: 12px; min-width: 620px; }
+.row { display: grid; gap: 12px; }
+.row.c3 { grid-template-columns: repeat(3, 1fr); }
+.row.c4 { grid-template-columns: repeat(4, 1fr); }
+.box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+.box b { display: block; font-size: 14px; }
+.box span { color: var(--muted); }
+.box.core { border: 2px solid var(--accent); background: var(--accent-soft); }
+.box.ext { border-style: dashed; }
+.cap { font-size: 12.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 4px 0 -4px; }
+.flow { display: flex; align-items: stretch; gap: 0; min-width: 620px; }
+.flow .st { flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; }
+.flow .st.final { border-style: dashed; }
+.flow .st b { display: block; font-size: 14.5px; }
+.flow .st span { color: var(--muted); }
+.flow .ar { align-self: center; padding: 0 8px; color: var(--muted); font-size: 12.5px; white-space: nowrap; text-align: center; }
+.flow .ar::after { content: "→"; display: block; font-size: 18px; line-height: 1; }
+dl.gloss { display: grid; grid-template-columns: 190px 1fr; gap: 6px 16px; max-width: 86ch; }
+dl.gloss dt { font-weight: 600; }
+dl.gloss dd { margin: 0; }
+@media (max-width: 600px) { dl.gloss { grid-template-columns: 1fr; } dl.gloss dd { margin-bottom: 8px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="Sections">
+  <div class="t">Sections</div>
+  <ol>
+    <li><a href="#summary">1. Summary</a></li>
+    <li><a href="#scope">2. Scope</a></li>
+    <li><a href="#architecture">3. Architecture</a></li>
+    <li><a href="#kernel">4. The kernel</a></li>
+    <li><a href="#change-request">5. The change request</a></li>
+    <li><a href="#people">6. People and permissions</a></li>
+    <li><a href="#definitions">7. Definitions and versions</a></li>
+    <li><a href="#integrations">8. Integrations</a></li>
+    <li><a href="#data">9. Data model</a></li>
+    <li><a href="#operations">10. Operations and cutover</a></li>
+    <li><a href="#plan">11. Plan</a></li>
+    <li><a href="#later">12. Later features</a></li>
+    <li><a href="#decisions">13. Decisions</a></li>
+    <li><a href="#open">14. Open questions</a></li>
+    <li><a href="#glossary">15. Glossary</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="doc">
+  <h1>Workflow Platform Design</h1>
+  <p>Version 3. Covers the first release and what it must leave room for.</p>
+  <div class="meta">
+    <span class="pill mvp">MVP: change request</span>
+    <span class="pill plain">Next.js · Node · Postgres</span>
+    <span class="pill plain">Kernel spec v2.9</span>
+  </div>
+</header>
+
+<section id="summary">
+  <h2>1. Summary</h2>
+  <p class="lead">We are rebuilding the Change Management intake as the first workflow on a small, generic workflow engine. The first release ships only that workflow, at parity with the existing product, with the workflow part made configurable.</p>
+  <ul>
+    <li><strong>The engine runs a small kernel:</strong> stages, transitions, waits and data writes. Everything an owner configures, such as an approval, expands into those parts.</li>
+    <li><strong>Each request has an append-only history,</strong> kept forever, that is the source of truth. The engine records its decisions as events, so replaying a history never re-runs workflow logic.</li>
+    <li><strong>Definitions are data,</strong> published through an API. A request stays on the version it started on.</li>
+    <li><strong>Later workflows shaped the permanent parts</strong> (event shapes and IDs) but are not built. Five more use cases are recorded in the use cases doc.</li>
+  </ul>
+  <div class="note">
+    This doc is the overview. The reference material lives in the <code>workflow-platform</code> folder:
+    each level referring only to the ones before it. <code>kernel/</code> holds the engine: <code>kernel-spec.md</code> (the rules, in full), <code>expansion-battery.md</code> (workflows expanded on paper to test the kernel) and <code>replay-only.yaml</code>. <code>composites/composites.md</code> describes the composites. <code>workflows/change-request/</code> holds the change request's definition and its test cases. <code>research/</code> keeps the reports from test rounds. Version 2.1 of this doc, with the earlier design and the detail for later use cases, is in this page's version history.
+  </div>
+</section>
+
+<section id="scope">
+  <h2>2. Scope</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>In the first release</th><th>Not in the first release</th></tr></thead>
+    <tbody>
+      <tr><td>The change request workflow, at parity with the existing product (with intentional exceptions where it is bad)</td><td>The five later use cases: tech debt initiatives, architecture review, metrics recertification, domain routing with Jira, metadata changes</td></tr>
+      <tr><td>Three approval paths, chosen by primary domain: all domains approve (the platform domain), the primary domain alone decides, or no approval (one domain)</td><td>Updating a request in flight to a newer definition (migrations)</td></tr>
+      <tr><td>Publishing a definition through the API and an admin page that accepts JSON</td><td>A visual workflow editor, and composites beyond Approval and Task</td></tr>
+      <tr><td>Admin override and break-glass access</td><td>Timers, child requests, date-triggered starts</td></tr>
+      <tr><td>Notifications through the existing email and Slack service</td><td>Attachments (no file storage yet)</td></tr>
+      <tr><td>The form renderer for the intake form</td><td>Importing legacy requests</td></tr>
+    </tbody>
+  </table></div>
+  <p>Scale is small: about one request every 10 seconds at most, across all future apps. Simplicity and correctness matter more than throughput.</p>
+  <h3>Why build</h3>
+  <p>The existing Change Management product is ours; this is its refactor. No product we reviewed covers the fixed needs without adding a JVM or a cluster to run: definitions as data published without a deployment, a permanent audit history as the source of truth, authorization checked when a person acts, and admin overrides recorded as skipped. Open-source BPMN engines (Operaton, Flowable) come closest and would still leave those four to build. Durable-execution engines (Temporal and similar) define workflows in code and do not keep history forever.</p>
+</section>
+
+<section id="architecture">
+  <h2>3. Architecture</h2>
+  <div class="diagram">
+    <div class="boxes">
+      <div class="cap">Our app</div>
+      <div class="row c3">
+        <div class="box"><b>Change Management pages</b><span>Request list, request page, my action items, intake form. Uses the company component library.</span></div>
+        <div class="box"><b>Admin pages</b><span>Publish a definition (JSON), inspect a request's history, override.</span></div>
+        <div class="box core"><b>Engine API</b><span>Start, act, admin turn, publish. One transaction per input.</span></div>
+      </div>
+      <div class="cap">Background workers</div>
+      <div class="row c3">
+        <div class="box"><b>Call dispatcher</b><span>Delivers pending calls at least once; a reconciler re-queues stalled ones.</span></div>
+        <div class="box"><b>Notifier</b><span>Reads committed events in order and applies the definition's notification rules.</span></div>
+        <div class="box"><b>Projection</b><span>Keeps the request table and action-item lists up to date from events.</span></div>
+      </div>
+      <div class="cap">Storage and outside systems</div>
+      <div class="row c3">
+        <div class="box core"><b>Postgres</b><span>Events, definitions, request table, pending calls, attempts log.</span></div>
+        <div class="box ext"><b>User directory</b><span>Group membership and people search.</span></div>
+        <div class="box ext"><b>Email and Slack service</b><span>Already in the codebase.</span></div>
+      </div>
+    </div>
+  </div>
+  <p>One engine hosts several apps. Each app is a <em>namespace</em> with its own pages and its own action-item list; apps share the engine and its tables, separated by a namespace column. There is no inbox shared across apps.</p>
+  <p>The UI is layered so later apps can reuse it: a headless client for the API, a set of UI components kept as a folder inside the app for now, and the Change Management pages on top.</p>
+</section>
+
+<section id="kernel">
+  <h2>4. The kernel</h2>
+  <p>The kernel is the small set of parts the engine executes. The full rules are in <code>kernel/kernel-spec.md</code>, which describes the engine only and names no workflow or composite.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Part</th><th>What it is</th><th>First release</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Stage</strong></td><td>A named scope. The root stage is always active, and exactly one child stage is active. Entering a stage opens its waits; leaving it cancels the ones still open. A final stage closes the request.</td><td>Root plus one level</td></tr>
+      <tr><td><strong>Transition</strong></td><td>A condition and a target stage. The condition is checked against recorded state after every input; there are no trigger events. It can write data when it fires.</td><td>Yes</td></tr>
+      <tr><td><strong>Wait</strong></td><td>The only thing that blocks. It opens, then closes once as completed, cancelled or skipped. A <em>person</em> wait is closed by an authorised person submitting an outcome and data. A <em>call</em> wait is closed by a connector's result.</td><td>Person and call</td></tr>
+      <tr><td><strong>Set</strong></td><td>A write to the request's data document, on a transition, at start, or by an admin.</td><td>Yes</td></tr>
+      <tr><td><strong>For each</strong></td><td>Opens one person wait per item of a list fixed when the stage is entered.</td><td>On person waits</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>How an input is processed</h3>
+  <ol>
+    <li>One input (a start, a person acting, a call result, an admin action) is one <em>turn</em>, under a per-request lock, in one database transaction.</li>
+    <li>The input is validated. A refused attempt writes nothing to history; it goes to a separate attempts log.</li>
+    <li><code>decide</code> reads the definition, evaluates conditions and writes events that spell out every consequence: which transition fired and what it read, which stage was entered, which waits opened with which resolved parameters.</li>
+    <li><code>evolve</code> folds events into state. Replay uses only <code>evolve</code>: it never evaluates a condition and never reads the definition.</li>
+  </ol>
+  <p>The cost of recording decisions is that a bug in <code>decide</code> is recorded as fact. It is repaired by an admin turn, never by rewriting history.</p>
+
+  <h3>Rules that shape everything else</h3>
+  <ul>
+    <li><strong>No unsolicited input.</strong> Every inbound fact closes a wait the engine opened. There are no signals or correlation keys.</li>
+    <li><strong>Joins are conditions.</strong> "All approved" or "any rejected" is an expression over the waits in the stage. An open wait always has a readable status, so these expressions are safe.</li>
+    <li><strong>Results belong to one entry of a stage.</strong> Re-entering a stage gives fresh waits. Anything that must persist is written to data.</li>
+    <li><strong>No clock.</strong> Each event carries its timestamp, and that is the only time the engine knows.</li>
+    <li><strong>Errors never count as false.</strong> A failed condition rolls the turn back and marks the request faulted until an admin acts.</li>
+    <li><strong>A stuck check runs after every turn.</strong> An open request with no open obligation and no open call is flagged for admins.</li>
+  </ul>
+
+  <h3>Events</h3>
+  <p>Every event carries the request ID, a sequence number, a timestamp, the turn it belongs to, a schema version and the engine build. The vocabulary is provisional until a second workflow has been built on it.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Kind</th><th>Events</th></tr></thead>
+    <tbody>
+      <tr><td>Inputs from outside</td><td><code>RequestStarted</code>, <code>WaitCompleted</code>, <code>CallResultLate</code>, <code>Overridden</code></td></tr>
+      <tr><td>Decisions the engine recorded</td><td><code>TransitionFired</code>, <code>StageEntered</code>, <code>StageExited</code>, <code>WaitOpened</code>, <code>WaitCancelled</code>, <code>WaitSkipped</code>, <code>DataSet</code>, <code>Faulted</code>, <code>RequestClosed</code>, <code>RequestReopened</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>A few fields exist only so later features need no change to old history: a stage entry records its parent entry, a wait ID carries a sequence number, and a request can record the request that started it. Each points to a case in the expansion battery.</p>
+</section>
+
+<section id="change-request">
+  <h2>5. The change request</h2>
+  <p>A request has one primary domain and zero or more other domains, taken from the form. It only moves forward. As in the existing product, it takes one of three paths, chosen by its primary domain when it is submitted. The platform is a domain like any other; which domains get which path is a list in the definition.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Request</th><th>Approval</th><th>Eng lead</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Primary domain is the platform</strong></td><td>Every domain's approvers must approve. Any one rejection rejects the request.</td><td>Picked by the primary domain's approver, who must pick one to approve.</td></tr>
+      <tr><td><strong>Primary domain is any other domain</strong></td><td>Only the primary domain's decision counts. Other domains are told and may record a decision, which has no effect. Their actions close when the primary decides.</td><td>Picked by the primary domain's approver.</td></tr>
+      <tr><td><strong>Primary domain is the no-approval domain</strong></td><td>None.</td><td>The first member of that domain's eng-lead group, read from the directory.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="diagram">
+    <div class="flow">
+      <div class="st"><b>Pending approval</b><span>Platform and domain requests. Two stages in the definition, one per approval rule.</span></div>
+      <div class="ar">approved</div>
+      <div class="st"><b>In development</b><span>The eng lead marks the request released.</span></div>
+      <div class="ar">released</div>
+      <div class="st final"><b>Released</b><span>Final.</span></div>
+    </div>
+    <p style="margin:12px 0 0;font-size:13.5px;color:var(--muted)">A rejection that counts moves the request to <strong>Rejected</strong> (final). A no-approval request skips Pending approval: it passes through <strong>Assigning eng lead</strong> for as long as the directory lookup takes, then enters In development.</p>
+  </div>
+  <ul>
+    <li><strong>The paths are stages, not a special approval.</strong> A routing stage with no waits sends the request to one of three stages in the turn it is submitted. The approval rule for each path is that stage's own transitions.</li>
+    <li><strong>Submission never blocks.</strong> If a domain has nobody able to approve, the request still waits in Pending approval, and a notification rule alerts the workflow admins from the recorded directory result.</li>
+    <li><strong>Requesters cannot approve their own request.</strong> Group membership is checked when the person acts, and the lookup is recorded with the approval.</li>
+    <li><strong>An admin can skip one domain's approval,</strong> but a skip never counts as an approval. To move the request on, the admin also jumps it forward and supplies the eng lead if nobody picked one.</li>
+    <li><strong>A failed lookup or an empty eng-lead group faults the request</strong> on the no-approval path. A failed call is an error by default, not a case the workflow handles; only the approvals' advisory membership check opts out. An admin either re-enters the stage, which asks the directory again, or sets the eng lead and jumps forward.</li>
+  </ul>
+  <h3>Composites</h3>
+  <p>The definition is written with two composites, described in full in <code>composites/composites.md</code>. Each is code in the repository, has a version, and expands into kernel parts when the definition is published.</p>
+  <ul>
+    <li><strong>Approval</strong> asks a group for a decision. It can run once per item of a list, can be optional (the decision is recorded but nothing waits for it), and can notify the people it asks. It owns no transition: it exposes <code>approved</code> and <code>rejected</code>, and the workflow decides what they do.</li>
+    <li><strong>Task</strong> asks one assignee to do something and say it is done.</li>
+    <li><strong>DomainApprovals</strong> is a third composite built only as a worked example of how to write one. The change request does not use it.</li>
+  </ul>
+  <p>History never names a composite. The published definition records which composite, version and parameters each element came from, and element IDs are derived from the composite instance (<code>primary.decision</code>, <code>release.task</code>) so a later migration can find the approval an old event belongs to.</p>
+  <p>The definition is in <code>workflows/change-request/definition.md</code>. Seventeen cases covering all three paths, refused attempts, admin skips and jumps, late call results and faults are written as test data next to it. They have not been run; no engine exists yet.</p>
+  <p><span class="pill open">To confirm</span> Whether one person in two domains' approver groups may approve for both (assumed yes).</p></section>
+
+<section id="people">
+  <h2>6. People and permissions</h2>
+  <ul>
+    <li><strong>Who may act</strong> is decided when they act: the engine looks up the actor's group memberships, checks them against the wait's assignees and its rule, and records the lookup as evidence.</li>
+    <li><strong>Who is being asked</strong> is recorded when the wait opens, as user and group references.</li>
+    <li><strong>My action items</strong> are the open person waits marked as obligations whose assignees name me or a group I belong to now. Each app has its own list.</li>
+    <li><strong>Viewing</strong> follows roles on the request: requester, approver, eng lead. Someone who used to hold a role keeps view access only.</li>
+  </ul>
+  <h3>Admin turns</h3>
+  <p>An admin action is one recorded event followed by its consequences. An admin can skip one wait, jump to a stage, set data, disable a transition for one request, clear a fault, and close or reopen a request. Jumping into a stage requires the admin to supply, or explicitly waive, the data that stage needs. What was skipped is recorded as skipped, never as done.</p>
+  <h3>Break-glass</h3>
+  <p>The dev team holds standing super-admin access so a production problem never waits on a deployment or an entitlement request. A break-glass user can do anything an admin can, including on their own requests. Safeguards come from accountability (a required reason, a time-boxed session, a team alert, an after-the-fact review list), not from hard-coded limits. The first super-admins are seeded by a database migration.</p>
+</section>
+
+<section id="definitions">
+  <h2>7. Definitions and versions</h2>
+  <ul>
+    <li>A definition is a JSON document stored in the platform database and published through the API. There is no server CLI access, so the admin page that accepts JSON is the publishing tool.</li>
+    <li>A published version is immutable. <strong>A request stays on the version it started on, forever.</strong></li>
+    <li>A saved draft of the intake form is not a request yet. It is checked against the latest version when submitted.</li>
+    <li>Conditions and computed values use CEL. Approver routing by domain is a CEL lookup, not a separate decision-table feature.</li>
+    <li>Publishing runs checks: expressions type-check, data is read only where it exists, every stage can reach a final stage, and every outcome leads somewhere. "Can never get stuck" cannot be proven in general; the runtime stuck check is the backstop.</li>
+    <li>The first release has two composites, Approval and Task, and one example composite, all written as code (section 5). Changing what a composite expands to requires a new composite version; a build test compares each expansion with a stored copy and fails otherwise.</li>
+  </ul>
+  <p>The definition format and its CEL environment are a second long-lived contract: the engine must be able to run a version for as long as a request on it is open.</p>
+</section>
+
+<section id="integrations">
+  <h2>8. Integrations</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>System</th><th>How it connects</th></tr></thead>
+    <tbody>
+      <tr><td>User directory</td><td>A call wait reads group members. The act-time membership check reads it too. The people picker for the eng lead searches it.</td></tr>
+      <tr><td>Email and Slack</td><td>The notifier consumes committed events and applies the definition's notification rules, delivering through the existing service. A sent notification is not part of a request's history.</td></tr>
+      <tr><td>Other systems, later</td><td>A call wait through a connector. A connector must honour the idempotency key and must never report "don't know" as a failure.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A call's result is recorded in history when it arrives, so replay never calls out. A result that arrives after its wait was cancelled is still recorded, as a late result that no condition can see.</p>
+  <p><strong>Forms.</strong> The first release renders the intake form itself. Using the internal form creator app through its API remains the preferred long-term route and has not been evaluated.</p>
+</section>
+
+<section id="data">
+  <h2>9. Data model</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Table</th><th>Holds</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>events</code></td><td>Every request's history</td><td>Append-only. The source of truth.</td></tr>
+      <tr><td><code>definitions</code></td><td>Published definition versions</td><td>Immutable rows.</td></tr>
+      <tr><td><code>requests</code></td><td>Current state of each request</td><td>Rebuildable from events. Data is one jsonb column with a general index, so publishing never changes the schema. Stores the active stages as a set, the readable ID, and a reserved legacy ID.</td></tr>
+      <tr><td><code>open_waits</code></td><td>Open waits and their assignees</td><td>Rebuildable. Feeds action-item lists.</td></tr>
+      <tr><td><code>pending_calls</code></td><td>Calls waiting for delivery</td><td>Written in the same transaction as the event that opened the call.</td></tr>
+      <tr><td><code>attempts_log</code></td><td>Refused attempts</td><td>Outside history.</td></tr>
+      <tr><td><code>super_admins</code></td><td>Break-glass membership and sessions</td><td>Seeded by migration.</td></tr>
+    </tbody>
+  </table></div>
+  <p>All tables carry the namespace. History is kept forever; there are no snapshots, because replay is a cheap fold over a few dozen events.</p>
+</section>
+
+<section id="operations">
+  <h2>10. Operations and cutover</h2>
+  <ul>
+    <li><strong>Faults.</strong> A faulted request shows in an admin list with the element and error. It keeps recording inputs and resumes after an admin turn.</li>
+    <li><strong>Stuck requests.</strong> Flagged automatically after any turn that leaves nothing open.</li>
+    <li><strong>Calls.</strong> Delivered by a Postgres job queue that can enqueue inside the same transaction (Graphile Worker or pg-boss). A reconciler re-queues any open call with no delivery in flight.</li>
+    <li><strong>Request inspector.</strong> An admin page showing a request's events, including which transition fired and the values it read.</li>
+  </ul>
+  <h3>Cutover</h3>
+  <ul>
+    <li>Requests already in flight finish in the existing product. New requests start in the new one.</li>
+    <li>Readable IDs in the new system start above the legacy maximum, so the two never collide.</li>
+    <li>Importing legacy requests is reconsidered after release. The request table reserves a legacy ID so it needs no schema change.</li>
+  </ul>
+</section>
+
+<section id="plan">
+  <h2>11. Plan</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th></th><th>Milestone</th><th>Done when</th></tr></thead>
+    <tbody>
+      <tr><td class="n">M0</td><td>Parity checklist</td><td>The existing product's behaviours are listed from its code, each marked keep or drop.</td></tr>
+      <tr><td class="n">M1</td><td>Walking skeleton</td><td>The engine passes test case T1, and the request table rebuilds from events.</td></tr>
+      <tr><td class="n">M2</td><td>Change request behaviour</td><td>The Approval and Task composites are built, plus the domain-approvals example, each with a version and the stored-expansion build test. All cases in <code>workflows/change-request/test-cases.yaml</code> pass, plus cases added from the parity checklist.</td></tr>
+      <tr><td class="n">M3</td><td>The app</td><td>Intake form, request page, action items and admin pages work end to end.</td></tr>
+      <tr><td class="n">M4</td><td>Operability</td><td>A staged incident is fixed through the admin pages alone, with no server access.</td></tr>
+      <tr><td class="n">M5</td><td>Cutover</td><td>New requests start in the new system.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The kernel is a small share of the work. Most of the effort is the form renderer and app, integration with the existing codebase, parity, operability and cutover.</p>
+</section>
+
+<section id="later">
+  <h2>12. Later features</h2>
+  <p>Each has a short reserved rule in the kernel spec and a paper case in the expansion battery. None is built in the first release.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Feature</th><th>What it adds</th><th>Needed by</th></tr></thead>
+    <tbody>
+      <tr><td><span class="pill later">Later</span> Child requests</td><td>Start another workflow, optionally wait for it, and let it outlive the stage that started it. Also the answer for a multi-step task inside a stage.</td><td>Tech debt initiatives, architecture review</td></tr>
+      <tr><td><span class="pill later">Later</span> Timer waits</td><td>Make something happen when a time arrives.</td><td>Deadlines, reminders</td></tr>
+      <tr><td><span class="pill later">Later</span> Act-time gates</td><td>Named checks per outcome, with messages, run when a person acts. They can read the time of the attempt.</td><td>Metric change control</td></tr>
+      <tr><td><span class="pill later">Later</span> Repeatable waits</td><td>An action a person can repeat within one stage entry, such as ticking a box or editing a field. Each use writes data.</td><td>Checklists that can be un-ticked</td></tr>
+      <tr><td><span class="pill later">Later</span> In-flight updates</td><td>Moving a request to a newer definition version.</td><td>Architecture review</td></tr>
+      <tr><td><span class="pill later">Later</span> Scheduling</td><td>Date-triggered starts and recurring duties, possibly as a separate "obligations" feature.</td><td>Metrics recertification</td></tr>
+      <tr><td><span class="pill later">Later</span> Workflow editor and more composites</td><td>Owners configure workflows in a UI from ready-made parts.</td><td>Every later app</td></tr>
+    </tbody>
+  </table></div>
+  <p>The metric change-control requirements were expanded on paper as a second workflow. They fit the model with no new event type; they need act-time gates and child requests, and one loop (revise and re-approve) is a known weak spot to revisit when that workflow is built.</p>
+</section>
+
+<section id="decisions">
+  <h2>13. Decisions</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>#</th><th>Decision</th><th>Replaces</th></tr></thead>
+    <tbody>
+      <tr><td class="n">1</td><td>Build a small engine; do not adopt a product.</td><td></td></tr>
+      <tr><td class="n">2</td><td>Kernel of stages, transitions, waits and Set. Approvals and forms are composites.</td><td>Separate node types for approval, task, action, branch and subflow</td></tr>
+      <tr><td class="n">3</td><td>History is the source of truth. The engine records its decisions; replay is a fold.</td><td>Replaying inputs through a version-gated reducer; snapshots; state hashes</td></tr>
+      <tr><td class="n">4</td><td>No unsolicited input; conditions read recorded state.</td><td>Events matched to waiters by correlation key</td></tr>
+      <tr><td class="n">5</td><td>Joins are CEL conditions.</td><td>A table of join policies</td></tr>
+      <tr><td class="n">6</td><td>External data enters history as call results and act-time evidence.</td><td>Prefetching data before each engine run</td></tr>
+      <tr><td class="n">7</td><td>CEL for all conditions and computed values.</td><td></td></tr>
+      <tr><td class="n">8</td><td>Definitions are data in the database, published through the API.</td><td></td></tr>
+      <tr><td class="n">9</td><td>A request stays on its definition version forever. Drafts follow the latest version at submit.</td><td>Configurable change policies</td></tr>
+      <tr><td class="n">10</td><td>One engine, many apps, separated by namespace. No shared inbox.</td><td></td></tr>
+      <tr><td class="n">11</td><td>An empty approver group never blocks submission. The alert is a notification rule.</td><td>Routing and alerting stages in the flow</td></tr>
+      <tr><td class="n">12</td><td>Admin override records what was skipped; a skip never counts as done.</td><td></td></tr>
+      <tr><td class="n">13</td><td>Break-glass can act on its own requests; safeguards are accountability, not hard limits.</td><td></td></tr>
+      <tr><td class="n">14</td><td>Notifications are a consumer of the event stream, outside history.</td><td>Notifications as engine effects</td></tr>
+      <tr><td class="n">15</td><td>Calls are delivered from a Postgres job queue in the same transaction as their event.</td><td></td></tr>
+      <tr><td class="n">16</td><td>Stages nest one level. A multi-step task inside a stage is a child request.</td><td>A node graph inside each stage</td></tr>
+      <tr><td class="n">17</td><td>No attachments in the first release.</td><td></td></tr>
+      <tr><td class="n">18</td><td>Cutover by draining the existing product; import later if it proves easy.</td><td></td></tr>
+      <tr><td class="n">19</td><td>The spec covers every known use case; only the first release is built. Test cases as data are the engine's first tests.</td><td></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="open">
+  <h2>14. Open questions</h2>
+  <ul>
+    <li>May one person in two domains' approver groups approve for both? Assumed yes.</li>
+    <li>Which directory API backs group membership and the people picker?</li>
+    <li>After what date are requests still open in the existing product imported or closed?</li>
+    <li>Does the existing product have saved drafts, SLA reminders or reports that must carry over? The parity checklist (M0) answers this.</li>
+    <li>Which JavaScript CEL library? It needs a short trial for conformance and custom functions.</li>
+    <li>Approvers editing a request's domain: the existing behaviour has known problems and is set aside for now.</li>
+    <li>Erasing personal data from a history that is kept forever: set aside for now.</li>
+  </ul>
+</section>
+
+<section id="glossary">
+  <h2>15. Glossary</h2>
+  <dl class="gloss">
+    <dt>Request</dt><dd>One running instance of a workflow, such as a single change request.</dd>
+    <dt>Definition</dt><dd>The published description of a workflow: its stages, waits, transitions and notification rules.</dd>
+    <dt>Kernel</dt><dd>The small set of parts the engine executes: stage, transition, wait, Set.</dd>
+    <dt>Composite</dt><dd>Something an owner configures, such as an approval, that expands into kernel parts when published.</dd>
+    <dt>Stage</dt><dd>Where a request is. Shown to users as its status.</dd>
+    <dt>Activation</dt><dd>One entry of a stage. Re-entering a stage creates a new activation with fresh waits.</dd>
+    <dt>Wait</dt><dd>Something the request is waiting on: a person's action or a call's result.</dd>
+    <dt>Obligation / option</dt><dd>A person wait that someone is being asked to do, versus one they may do. Only obligations appear in action-item lists.</dd>
+    <dt>Transition</dt><dd>A condition that, when true, moves the request to another stage.</dd>
+    <dt>Turn</dt><dd>The processing of one input, in one database transaction.</dd>
+    <dt>History</dt><dd>The append-only list of a request's events. The source of truth.</dd>
+    <dt>Decide / evolve</dt><dd><code>decide</code> works out what an input causes and records it as events. <code>evolve</code> applies events to state and is all that replay uses.</dd>
+    <dt>Replay</dt><dd>Rebuilding a request's state by applying its events in order.</dd>
+    <dt>Call</dt><dd>A request to an outside system through a connector, with a key that makes repeats safe.</dd>
+    <dt>Idempotency key</dt><dd>An identifier sent with a call so the outside system can recognise a repeat and not act twice.</dd>
+    <dt>Fault</dt><dd>A request the engine has flagged for an admin: an expression failed, or nothing is left open.</dd>
+    <dt>Admin turn</dt><dd>An admin's recorded intervention: skip, jump, set data, close or reopen.</dd>
+    <dt>Break-glass</dt><dd>Standing super-admin access for the dev team, for emergencies.</dd>
+    <dt>Namespace</dt><dd>One workflow app on the shared engine, with its own pages and lists.</dd>
+    <dt>CEL</dt><dd>Common Expression Language, used for conditions and computed values.</dd>
+    <dt>Expansion battery</dt><dd>Workflows expanded on paper into kernel parts and events, to test that the kernel can express them.</dd>
+    <dt>Insurance field</dt><dd>A field recorded now only so a later feature needs no change to old history.</dd>
+    <dt>Drain</dt><dd>Letting in-flight requests finish in the old system while new ones start in the new one.</dd>
+  </dl>
+</section>
+</main>
+</div>
+</body>
+</html>
+===\n./kernel/replay-only.yaml\n===
+# Replay-only cases, against kernel-spec.md v2.9.
+# `by` shorthand is as in workflows/change-request/test-cases.yaml.
+#
+# The MVP's `decide` never produces these histories. Each case checks that `evolve` can replay a
+# history that uses an insurance field, so the field is not dropped. Given the events, replay must
+# produce the expected state.
+
+cases:
+
+  - id: R1
+    name: Two child stages active at once (battery P4)
+    needs: [StageEntered.parentActivation, "active stages stored as a set"]
+    history:
+      - [RequestStarted, { by: rita }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+      - [StageEntered, { activation: a2, stage: Legal, parentActivation: a1 }]
+      - [StageEntered, { activation: a3, stage: Security, parentActivation: a1 }]
+      - [WaitOpened, { wait: Legal.review@a2, kind: person, role: obligation }]
+      - [WaitOpened, { wait: Security.review@a3, kind: person, role: obligation }]
+      - [WaitCompleted, { wait: Legal.review@a2, outcome: approve, by: lena }]
+      - [StageExited, { activation: a2, mode: normal }]
+    expectState:
+      activeStages: [ { activation: a1, stage: root }, { activation: a3, stage: Security, parent: a1 } ]
+      open: [Security.review@a3]
+
+  - id: R2
+    name: A second instance of the same wait in one stage entry (battery C3)
+    needs: [wait ID seq]
+    history:
+      - [RequestStarted, { by: rita }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+      - [StageEntered, { activation: a2, stage: PendingApproval, parentActivation: a1 }]
+      - [WaitOpened, { wait: "PendingApproval.items[lineage]@a2", seq: 1, kind: person }]
+      - [WaitOpened, { wait: PendingApproval.approval@a2, seq: 1, kind: person }]
+      - [WaitCompleted, { wait: "PendingApproval.items[lineage]@a2", seq: 1, outcome: done, by: cara }]
+      - [WaitOpened, { wait: "PendingApproval.items[lineage]@a2", seq: 2, kind: person }]
+    expectState:
+      activeStages: [ { activation: a1, stage: root }, { activation: a2, stage: PendingApproval, parent: a1 } ]
+      waits:
+        - { wait: "PendingApproval.items[lineage]@a2", seq: 1, status: completed }
+        - { wait: "PendingApproval.items[lineage]@a2", seq: 2, status: open }
+        - { wait: PendingApproval.approval@a2, seq: 1, status: open }
+
+  - id: R3
+    name: A child request records its parent (battery P1, P2)
+    needs: [RequestStarted.parent]
+    history:
+      - [RequestStarted, { by: "system:engine", parent: { requestId: req-100, wait: Build.start@a4 } }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+    expectState:
+      parent: { requestId: req-100, wait: Build.start@a4 }
+===\n./kernel/expansion-battery.md\n===
+# Expansion test battery
+
+Each case is a workflow expanded into the kernel's blocks and events on paper. A case passes when it uses only what the kernel spec defines. The battery is also the record of why fields exist: if a case can no longer be expressed, something it needs was removed.
+
+Cases the MVP builds have a definition and test cases as data under `workflows/` (inputs and the exact events expected). The others stay on paper, with small replay-only cases for the insurance fields.
+
+| Case | Workflow | Built in the MVP | Status | Test data |
+|---|---|---|---|---|
+| C1 | Change request | Yes | Passes on spec v2.9 | `workflows/change-request/` (T1 to T12) |
+| C2 | Metric change control | No | Expressible with reserved features; the revise-and-reapprove loop is a known weak spot | Paper |
+| C3 | Checklist item ticked, un-ticked, re-ticked | No | Representation only | `replay-only.yaml` R2 |
+| P1 | Start without waiting, join later | No | Passes with child requests | Paper; R3 covers the parent field |
+| P2 | Work that survives a send-back | No | Passes with child requests | Paper; R3 |
+| P3 | Fan-out where each leg runs several steps | No | Passes with child requests | Paper |
+| P4 | Two stage paths active at once | No | Representation only | `replay-only.yaml` R1 |
+| I1 | Ten repeated in-stage actions | No | 3 of 10 clean with repeatable waits; the rest need an undesigned layer; history is safe for all | Paper; reports in `research/instage-test/` |
+
+## C1. Change request
+
+The definition is `workflows/change-request/definition.md`; its cases are T1 to T12 in `workflows/change-request/test-cases.yaml`. It has three paths: all domains approve, the primary domain alone approves, and no approval.
+
+Passes if: every trace uses only the events in section 5 of the spec.
+
+Needs: `foreach` on person waits; the guarded wait-status record; `CallResultLate`; admin skip of a single wait; stage `requires` with supply-or-waive on a jump; notification rules; a stage with no waits; an admin jump to the current stage.
+
+## C2. Metric change control
+
+Source: `~/Downloads/ETIP_Change_Control_Governance_TRD.md`. A card moves through New Request, Discovery, Pending Approval, Pending Implementation, Deployed and Archived, operated by a Concierge.
+
+How it maps:
+- Each lane is a stage. Cancel is a wait on the root stage.
+- The Concierge moving a card is a person wait whose outcome fires the transition.
+- Discovery edits re-enter the stage. Nothing is lost, because no approvals exist there.
+- In Pending Approval, each checklist item is its own person wait (`foreach` over the items for the change type), and each forum outcome is a wait. Notes and links are comments, outside the kernel.
+- The AE approval round is a child request, awaited in Pending Approval with `onCancel: terminate`.
+- The move to Pending Implementation is one wait with two outcomes, each with act-time gates.
+
+```
+PendingApproval:
+  waits:
+    items:   person { foreach: data.checklist, assignees: [group: concierge], outcomes: [done] }
+    forums:  person { foreach: data.forums, assignees: [group: concierge], outcomes: { recorded: {...} } }
+    approval: child { request: data.approvalId, onCancel: terminate }
+    advance: person { assignees: [group: concierge], outcomes:
+      { advance:   { may: [ { id: checklist, when: required items done },
+                            { id: ae,        when: waits.approval.outcome == 'approved' },
+                            { id: curation,  when: now >= data.minGoLive } ] },
+        fastTrack: { may: [ { id: ae, when: waits.approval.outcome == 'approved' } ],
+                     data: { comment: string } } } }
+  t: when waits.advance.outcome in ['advance', 'fastTrack']  set { override: ... }  -> PendingImplementation
+```
+
+Passes if: ticking a checklist item does not disturb an AE approval in progress; a blocked move tells the Concierge which check failed; a fast track records its comment; a rejection keeps the card in Pending Approval.
+
+Needs: act-time gates; child requests; `foreach` on person waits.
+
+Known weak spot: revise and re-approve. After a rejection the approval child has closed, and a second approval round in the same stage entry needs either a second instance of the await (repeatable waits) or a re-entry that resets the checklist. The child also holds a snapshot of the card from when it started. Revisit when change control is built.
+
+## C3. Checklist item ticked, un-ticked, re-ticked
+
+In C2's Pending Approval, the Concierge ticks an item, un-ticks it, and ticks it again, while an AE approval is in progress.
+
+Passes if: the history can hold a second instance of the same wait in the same stage entry (`seq` 2), and the AE approval is not reset.
+
+Needs: `seq` in the wait ID.
+
+## I1. Repeated in-stage actions
+
+Ten patterns, each expanded under three models: data-driven (an action is a validated write), event-driven (named events with handlers), and the hybrid in the spec (a repeatable wait with its own Set). A fourth agent tried to show that the history favours one model. Reports: `research/instage-test/`.
+
+1. Checkbox: tick, un-tick, re-tick; a gate needs all required items.
+2. Field edit, several times; the latest value is used.
+3. Question and answer while an approval stays open.
+4. Reassign an open task.
+5. Add or remove a reviewer mid-review.
+6. An edit that dismisses approvals already given.
+7. An external call on every use, with its result known to the workflow.
+8. Two people act on the same item at once.
+9. A correction; audit shows both values.
+10. A value derived from several in-stage actions.
+
+Result: the three models differ in the definition language, not in the history. Each action records the action and its data write, linked by `turn`; no old history becomes unreplayable under any model. From the hybrid, moving to data-driven needs no history change, and moving to event-driven needs only additions. The hybrid alone handles 3 of the 10 cleanly; the limits are listed in the spec, section 8.
+
+Needs: the patch format in `DataSet`; `DataSet.element` and source `wait`; open payload enums; `seq` as an ordinal with "highest is current"; `turn` as the causing input on the fault path; typed `by`.
+
+## Child rules assumed (to be written into the spec as reserved)
+
+- **Start** is a call: `call { connector: engine, op: start, args: { workflow, version, input }, effect: write }`. Its result is `{ requestId }`. Default idempotency key is per request, so re-entering the stage returns the same child. The child's `RequestStarted` carries `parent: { requestId, wait }`.
+- **Await** is a wait of kind `child`: `{ request: <CEL -> requestId>, onCancel: detach | terminate }`. It completes with the child's final stage as outcome and the child's output as data.
+- An await **never completes in the turn that opens it**. Completion always arrives as a later input, through the same delivery path whether the child closed long ago or just now. `decide` never reads another request's state.
+- Cancelling an await (its stage is exited) leaves the child running when `detach`, and closes it when `terminate`. A parent closing a child is recorded in the child's history as `Overridden` by a system identity.
+- A parent's definition pins the child workflow's version, so the publish check can verify the outcomes its conditions read.
+
+## P1. Start without waiting, join later (initiative intake)
+
+A starts S and moves on; A goes to one of B, C, D; E needs one of B/C/D and also S; S's outcome can divert the parent.
+
+```
+A:       waits: a: person {...}                          t: when a done -> StartS
+StartS:  waits: start: call { engine.start, workflow: S }
+         t: when start ok  set { sId: waits.start.data.requestId }  -> B | C | D (by data)
+B:       waits: b: person {...}
+                s: child { request: data.sId, onCancel: detach }
+         t_div:  when waits.s.outcome == 'declined'  -> F
+         t_done: when waits.b.outcome == 'done'      -> E
+(C, D likewise)
+E:       waits: s: child { request: data.sId, onCancel: detach }
+         t_div: when waits.s.outcome == 'declined'  -> F
+         t_go:  when waits.s.outcome == 'approved'  -> Work
+```
+
+Events used: `WaitOpened {kind: call}`, `WaitCompleted`, `DataSet`, `WaitOpened {kind: child}`, `WaitCancelled {cause: stage exit}` (the await in B when moving to E), `WaitOpened {kind: child}` again in E, `WaitCompleted`. In S's history: `RequestStarted {parent}`.
+
+Passes if: S finishing before, during or after B gives the same parent path; leaving B never closes S.
+
+Needs: `RequestStarted.parent`; `WaitOpened` params for kind child (`request`, `onCancel`).
+
+## P2. Work that survives a send-back (design review)
+
+Stage Build starts a prototype; stage 10 sends the request back to Draft; the prototype keeps running with its own status; a later stage reads its result.
+
+```
+Build:   waits: start: call { engine.start, workflow: Prototype }      (key: per request)
+         t: when start ok  set { protoId: waits.start.data.requestId }  -> Next
+...
+Late:    waits: lead: person { outcomes: [advance, sendBack] }
+         t_back: when waits.lead.outcome == 'sendBack'  -> Draft
+Final:   waits: proto: child { request: data.protoId, onCancel: detach }
+```
+
+Passes if: after `t_back` the prototype's history shows no event caused by the parent; re-entering Build returns the same `requestId` (no second prototype); the parent's page can list the prototype and its current stage through `parent`.
+
+Needs: per-request idempotency key on write calls; `RequestStarted.parent`.
+
+## P3. Fan-out where each leg runs several steps (design review)
+
+Each reviewer gets a thread (question, answer, verdict). Verdicts combine: one veto sends back; two approvals accept.
+
+```
+StartThreads: waits: start: call { foreach: data.reviewers, engine.start, workflow: ReviewerThread,
+                                   key: item + '/' + string(data.round) }
+              t: when waits.start.all(w, w.outcome == 'ok')
+                 set { threads: waits.start.map(w, w.data.requestId) }  -> Review
+Review:       waits: threads: child { foreach: data.threads, request: item, onCancel: terminate }
+              t_veto: when waits.threads.exists(w, w.outcome == 'veto')
+                      set { round: data.round + 1 }                      -> Draft
+              t_ok:   when waits.threads.filter(w, w.outcome == 'approve').size() >= 2  -> Accepted
+```
+
+Passes if: each thread has its own visible stage; a veto closes the other threads (their reviewers' tasks disappear) and each closed thread's history shows `Overridden` by the system identity; the second round starts new threads, not the closed ones.
+
+Needs: `foreach` on call and child waits; `onCancel: terminate`; the round counter in the start key.
+
+## P4. Two stage paths active at once in one request (representation only)
+
+Not supported by the spec's rules: exactly one child stage is active. This case checks only that the history and stored state could represent it, so that adding it later needs no change to old events.
+
+Passes if: a history containing `StageEntered {activation: a2, parent: a1}` and `StageEntered {activation: a3, parent: a1}` with neither exited replays to a state holding both; the request table stores active stages as a list.
+
+Needs: `StageEntered.parentActivation`; active stages stored as a set.
+
+## Result of the first run (paper)
+
+- P1, P2, P3 are expressible with child requests. No new event type.
+- P4 is representable once `StageEntered` carries its parent activation.
+- Fields to add: `RequestStarted.parent`; `StageEntered.parentActivation`; child params on `WaitOpened`.
+- Rules to add: the five child rules above.
+- Costs seen: the await on S is repeated in every stage that needs it (or needs a third nesting level); a fan-out takes two stages (start, then await); fan-out re-entry needs a round counter in the key, which a composite should own; a child gets the parent's data only as a snapshot at start.
+===\n./kernel/kernel-spec.md\n===
+# Workflow engine kernel: spec v2.9
+
+Status: proposal. This file is the reference for the engine. It does not describe any workflow or composite; those live in `composites/` and `workflows/` and refer to this file, never the reverse.
 
 The spec covers every known use case; only the MVP is built. Three tiers:
 - **Permanent layer** (event shapes, IDs, insurance fields): specified in full now. Section 5.
-- **MVP behaviour:** specified in full. Sections 2 to 4, 6, 7 and 9. Its tests are in `test-cases/`.
+- **MVP behaviour:** specified in full. Sections 2 to 7.
 - **Later features:** one short reserved rule each, in section 8, plus a paper case in `expansion-battery.md`. Full spec when built.
 
 The spec stays terse. The reason an insurance field exists is the battery case it points to: if that case can no longer be expressed, the field was removed.
 
 ## 1. Scope
 
-The change-request workflow is the refactor of the existing Change Management product: same behaviour, with the workflow part made configurable. It is the only workflow in the MVP.
-
 | Part | MVP | Reserved (slots held, not built) |
 |---|---|---|
 | Stage | Root stage plus one level of child stages | Deeper nesting is not planned: a multi-step task inside a stage is a child request. History can already describe nesting (`parentActivation`). |
 | Transition | Yes | |
 | Wait: person | Yes, with a single `may` rule | Act-time gates; repeatable waits |
-| Wait: call | Yes (directory read) | |
+| Wait: call | Yes | |
 | Wait: timer | No | Section 8 |
 | Wait: child | No | Section 8 |
 | `foreach` | Yes, on person waits | On other wait kinds |
@@ -1522,7 +1315,7 @@ The event vocabulary is provisional until a second use case has been built again
 
 **Definition.** `{start, root, notifications}`. `start` is `{schema, set}`: the input is validated against `schema` and `set` writes it into data. `root.initial` names the child stage a request starts in.
 
-**Stage.** A named scope. The root stage is always active; exactly one child stage is active. Each entry creates an *activation* with a new ID. A stage declares waits, transitions, an optional display `status`, and optional `requires` (data paths that must exist on entry). Entering a stage opens all its waits. Leaving it cancels the ones still open. A `final` stage closes the request. Replay state and the request table store the active stages as a set; only `decide` enforces "exactly one active child" (battery P4).
+**Stage.** A named scope. The root stage is always active; exactly one child stage is active. Each entry creates an *activation* with a new ID. A stage declares waits, transitions, an optional display `status`, and optional `requires` (data paths that must exist on entry). Entering a stage opens all its waits. Leaving it cancels the ones still open. A stage may have no waits: its transitions are evaluated in the turn that enters it, so it works as a routing step. A `final` stage closes the request. Replay state and the request table store the active stages as a set; only `decide` enforces "exactly one active child" (battery P4).
 
 **Transition.** `{id, when: CEL, set: {path: CEL}, to: stage}` declared on a stage.
 - Level-triggered: `when` is evaluated over recorded state at the end of every turn.
@@ -1536,7 +1329,7 @@ The event vocabulary is provisional until a second use case has been built again
 - `seq` is an ordinal per `(element, activation, key)`, whatever caused the new instance. The highest `seq` is the current instance, for every wait kind, in `evolve` and in CEL. The MVP's `decide` only ever writes 1, but no code may assume `seq` is 1, that one instance exists, or that a predecessor completed (battery C3, I1). A repeated write call's idempotency key includes `seq`.
 - In CEL every wait in scope is always readable as `waits.<element ID>` (for example `waits.primary.decision`) = `{status, outcome, by}`; `outcome` is `""` unless completed; `by` is who completed it, `{type, id}`. `waits.<name>.data` may be read only under a guard on that wait's outcome; the publish check enforces it.
 - *Person:* `assignees` (user and group references, recorded at open, not expanded), `may` (optional CEL, default true; reads `data`, `request`, `actor`, waits in scope), `outcomes` (enum, each with a data schema), `role: obligation | option`. At act time the engine looks up the actor's memberships, checks `assignees` and `may`, validates data, and records the lookup as evidence. A refused attempt changes nothing and goes to an attempts log outside history.
-- *Call:* `connector`, `op`, `args`, `effect: read | write`, optional `idempotencyKey`. Outcome `ok` or `failed`. Default idempotency key: reads are per activation (re-entry reads again); writes are per request. The pending call is written in the same transaction as the event that opened it; a dispatcher delivers at least once, and a reconciler re-queues anything open with no delivery in flight.
+- *Call:* `connector`, `op`, `args`, `effect: read | write`, optional `idempotencyKey`, optional `onFailure: fault | outcome` (default `fault`). A result is `ok` or `failed`. By default a failed call is an error, not a case the workflow handles: the request faults (section 3). With `onFailure: outcome`, `failed` is an ordinary outcome that conditions may read and the stage's transitions must cover. Default idempotency key: reads are per activation (re-entry reads again); writes are per request. The pending call is written in the same transaction as the event that opened it; a dispatcher delivers at least once, and a reconciler re-queues anything open with no delivery in flight.
 - *Connector obligations:* honour the key. For a key that already succeeded, return that result and do nothing else (look up by key before creating if the external system has no idempotency support). For a key that failed, try again. Never report a timeout or "don't know" as `failed`; keep the call pending. An author who wants a retry with different arguments sets an explicit key.
 - *`foreach`:* `foreach: <CEL list>` on a person wait opens one wait per item when the stage is entered. The list is evaluated once and recorded; it is not re-evaluated if data changes later. Items must be distinct (a duplicate is a fault). `item` is available in the wait's other expressions and becomes the wait's `key`. In CEL the waits read as a list: `waits.<name>.all(w, ...)`, `.exists(w, ...)`. An empty list opens nothing, and `all` over it is true.
 
@@ -1544,7 +1337,7 @@ The event vocabulary is provisional until a second use case has been built again
 
 **CEL context.** `data`; `request` = `{id, by, at}` (`by` is the starter, `{type, id}`); `actor` = `{type, id}` (in `may` only); `waits` for the current activations of the root and the active child. Earlier activations are invisible. There is no clock. Anything that must persist goes through Set.
 
-Waits on the root stage are open for the whole life of the request and are cancelled when it closes. The change request does not use them.
+Waits on the root stage are open for the whole life of the request and are cancelled when it closes.
 
 ## 3. Turns
 
@@ -1559,14 +1352,14 @@ Event order within a turn: the input; then for each firing `TransitionFired`, `D
 
 `evolve(state, event)` is the only code replay uses. It never evaluates CEL and never reads the definition.
 
-**Faults.** If a CEL evaluation errors, or a turn exceeds 50 firings, the turn's decisions are rolled back, the input event is kept, and `Faulted{kind: error, element, error}` is appended. A faulted request still accepts and records inputs but runs no `decide` until an admin turn clears the fault; then `decide` runs for the kept inputs in order. A CEL error is never treated as false. Reading a waived `requires` path is a CEL error. A `stuck` fault is a flag for admins: it does not stop evaluation, and it is cleared by an admin turn or by the request closing.
+**Faults.** If a CEL evaluation errors, a turn exceeds 50 firings, or a call without `onFailure: outcome` returns `failed`, the turn's decisions are rolled back, the input event is kept, and `Faulted{kind: error, element, error}` is appended. For a failed call the input is its `WaitCompleted{outcome: failed}` and the element is the wait; the fault is raised once, when the result is accepted, and an admin retries by re-entering the stage. A faulted request still accepts and records inputs but runs no `decide` until an admin turn clears the fault; then `decide` runs for the kept inputs in order. A CEL error is never treated as false. Reading a waived `requires` path is a CEL error. A `stuck` fault is a flag for admins: it does not stop evaluation, and it is cleared by an admin turn or by the request closing.
 
 ## 4. Admin turns
 
 `Overridden {by, reason, breakGlassSession?, actions, waived}` is an input event. Its consequences are ordinary events in the same turn. All actions are applied first; `decide` and the stuck check run once, at the end of the turn. Actions:
 
 - **Skip one wait:** `WaitSkipped`. Conditions see `status: skipped`. A skip alone never decides anything: it does not satisfy `otherwise` or any outcome test. To move on, the admin also jumps, or the author writes an explicit path (`when waits.x.status == 'skipped'`).
-- **Jump to a stage:** open waits in the exited stage are skipped; the event records `from` and `to`. For each path in the target's `requires`, the admin supplies a value or lists it in `waived`.
+- **Jump to a stage:** open waits in the exited stage are skipped; the event records `from` and `to`. The target may be the stage the request is already in: that re-enters it (new activation, fresh waits, read calls made again). For each path in the target's `requires`, the admin supplies a value or lists it in `waived`.
 - **Set data:** `DataSet{source: admin}`.
 - **Disable a transition for this request.**
 - **Clear a fault.**
@@ -1607,12 +1400,12 @@ Envelope on every event: `requestId`, `seq`, `at` (the only clock), `turn`, `v` 
 - Every CEL expression type-checks against the data schema, wait outcomes and connector result types.
 - Wait reads are in scope; `.data` reads are guarded.
 - A data path is read only where it is set on every path to that point or listed in the stage's `requires`.
-- Outcomes are enums. Each stage's transitions cover every combination of its waits' outcomes, or the stage has an `otherwise`.
+- Outcomes are enums. Each stage's transitions cover every combination of its waits' outcomes, or the stage has an `otherwise`. A call's `failed` counts, and may be read, only with `onFailure: outcome`.
 - Every stage can reach a final stage.
 - Every cycle of transitions passes through a condition on a wait opened inside the cycle.
 - Warning: a write call in a stage that a root transition can interrupt.
 
-"Cannot get stuck" is not provable in general; the runtime stuck check is the backstop. Whether anybody is able to act on a person wait is not a kernel concern: the approval composite reads group membership, and a notification rule alerts on the result.
+"Cannot get stuck" is not provable in general; the runtime stuck check is the backstop. Whether anybody is able to act on a person wait is not a kernel concern; a composite can check it with a call and a notification rule.
 
 ## 7. Notification rules
 
@@ -1634,7 +1427,7 @@ notifications:
 Other contracts:
 - The published definition format and its CEL environment are a second long-lived contract: the engine must be able to run `decide` for a definition version for as long as a request on it is open.
 - Composites are expanded at publish; history never names one. A later migration finds the composite through the definition (history -> definition version -> element -> composite instance). Replay still never reads the definition. Three rules keep that lookup usable:
-  - An expanded element's ID is the composite instance ID plus a local name (`primary.decision`, `primary.members`), never positional. It stays the same across composite versions when the element means the same thing.
+  - An expanded element's ID is the composite instance ID plus a local name (`primary.decision`, `primary.members`), never positional. It stays the same across composite versions when the element means the same thing. Instance IDs are unique within a stage; an element's full ID, and the ID of any notification rule a composite emits, is prefixed with the stage (`Pending.primary.decision`).
   - The published definition records, for each composite instance: composite name, composite version, and the parameters used.
   - Any change to a composite's expansion needs a new composite version. In the MVP composites are code: a build test compares each expansion with a stored copy and fails if it changed without a version bump.
 - Action-item list = open person waits with `role: obligation` whose assignees name the viewer or a group they belong to now. Options show on the request page only.
@@ -1673,72 +1466,521 @@ Other contracts:
 - Transitions stay one-shot per stage entry.
 - Known limits: work on every occurrence, dismissing some approvals after an edit, a repeatable stage move, reassignment, adding to a `foreach` list, and question-and-answer as a real task. These need a completion that can open or replace waits and calls. That layer is not designed; it must be opt-in so it stays additive.
 
-## 9. The change request
-
-The request has one primary domain and zero or more other domains, from the form. Every domain's approvers must approve. The primary domain's approver must pick the eng lead in order to approve. The request only moves forward.
-
-```
-start: { schema: changeForm, set: { form: input } }
-root:
-  initial: Pending
-  stages:
-    Pending:
-      waits:
-        primary.members:  call { connector: directory, op: membersOf, effect: read,
-                                 args: { groups: [approverGroup[data.form.primaryDomain]] } }
-        primary.decision: person { assignees: [group: approverGroup[data.form.primaryDomain]],
-                                   may: actor != request.by, role: obligation,
-                                   outcomes: { approve: { engLead: user }, reject: { reason: string } } }
-        others.members:   call { connector: directory, op: membersOf, effect: read,
-                                 args: { groups: data.form.otherDomains.map(d, approverGroup[d]) } }
-        others.decision:  person { foreach: data.form.otherDomains,
-                                   assignees: [group: approverGroup[item]],
-                                   may: actor != request.by, role: obligation,
-                                   outcomes: { approve: {}, reject: { reason: string } } }
-      transitions:
-        t_reject: when waits.primary.decision.outcome == 'reject'
-                       || waits.others.decision.exists(w, w.outcome == 'reject')    ->  Rejected
-        t_accept: when waits.primary.decision.outcome == 'approve'
-                       && waits.others.decision.all(w, w.outcome == 'approve')
-                  set { engLead: waits.primary.decision.data.engLead }              ->  InDevelopment
-    InDevelopment:  requires: [engLead]
-      waits:  release.task: person { assignees: [user: data.engLead], role: obligation, outcomes: [released] }
-      transitions:  t_release: when waits.release.task.outcome == 'released'  ->  Released
-    Released: final     Rejected: final
-notifications:
-  - id: primary.noApprover
-    on:   WaitCompleted primary.members
-    when: outcome == 'failed' || data.groups.exists(g, !g.members.exists(m, m != request.by.id))
-    send: { template: alertAdmins, to: group: workflowAdmins }
-  - id: others.noApprover
-    on:   WaitCompleted others.members
-    when: (same as primary.noApprover)
-    send: { template: alertAdmins, to: group: workflowAdmins }
-  - id: n_task
-    on:   WaitOpened
-    when: kind == 'person' && role == 'obligation'
-    send: { template: newTask, to: assignees }
-```
-
-This is the published (expanded) form. It comes from three composite instances: `primary` and `others` (Approval) and `release` (Task). The composites themselves are described in the design doc, not here; the kernel only sees their expansion. Element IDs follow the rule in section 7. `others.members` is opened even when there are no other domains (an empty group list).
-
-No transition reads a `members` call. Its result is recorded so the notifier can alert admins when a domain has nobody able to approve; the request is submitted either way and waits.
-
-Happy path with one other domain (input first in each turn):
-
-1. `RequestStarted` · `DataSet` · `StageEntered root` · `StageEntered Pending` · `WaitOpened primary.members` · `WaitOpened primary.decision` · `WaitOpened others.members` · `WaitOpened others.decision[domainB]`
-2. `WaitCompleted primary.members ok`, then `WaitCompleted others.members ok` (one turn each)
-3. `WaitCompleted others.decision[domainB] approve`
-4. `WaitCompleted primary.decision approve {engLead}` · `TransitionFired t_accept` · `DataSet` · `StageExited Pending` · `StageEntered InDevelopment` · `WaitOpened release.task`
-5. `WaitCompleted release.task` · `TransitionFired t_release` · `StageExited InDevelopment` · `StageEntered Released` · `RequestClosed`
-
-The edge cases are the test cases in `test-cases/c1-change-request.yaml`.
-
-Assumptions to confirm against the existing product: approvals for all domains run in parallel; one rejection rejects the whole request; a person in two domains' groups may approve for both.
-
-## 10. Not addressed
+## 9. Not addressed
 
 - Erasing personal data from history (set aside for now).
 - Date-triggered starts and scheduling (set aside; possibly a separate obligations feature later).
 - A grammar and an author's guide for the definition format.
 - A bulk admin action across many requests.
+===\n./workflows/change-request/definition.md\n===
+# Change request: workflow definition
+
+The first workflow on the engine. It reproduces the existing Change Management product. It is written with the composites in `composites/composites.md` and runs on the kernel in `kernel/kernel-spec.md`. Its test cases are in `test-cases.yaml`, next to this file.
+
+## Behaviour
+
+A request has one primary domain and zero or more other domains, from the form. It only moves forward. It takes one of three paths, chosen by its primary domain. The platform is a domain like any other; the two special cases are lists of domains in the definition's constants.
+
+| Request | Approval | Eng lead |
+|---|---|---|
+| Primary domain is the platform | Every domain's approvers must approve. Any one rejection rejects the request. | Picked by the primary domain's approver, who must pick one to approve. |
+| Primary domain is any other domain | Only the primary domain's decision counts. Other domains are told and may record a decision, which has no effect. Their actions close when the primary decides. | Picked by the primary domain's approver. |
+| Primary domain is the no-approval domain | None. | The first member of that domain's eng-lead group. |
+
+After approval the eng lead marks the request released.
+
+## Definition (as authored)
+
+```
+start: { schema: changeForm, set: { form: input } }
+constants: approverGroup, engLeadGroup, allApprovalDomains, noApprovalDomains
+root:
+  initial: Route
+  stages:
+    Route:                                  # no waits; passed through in the start turn
+      transitions:
+        t_skip:     when data.form.primaryDomain in noApprovalDomains     ->  AssignLead
+        t_all:      when data.form.primaryDomain in allApprovalDomains    ->  PendingAll
+        t_domain:   otherwise                                             ->  PendingPrimary
+
+    AssignLead:     status: Assigning eng lead
+      waits:
+        leads: call { connector: directory, op: membersOf, effect: read,
+                      args: { groups: [engLeadGroup[data.form.primaryDomain]] } }
+      transitions:
+        t_lead: when waits.leads.outcome == 'ok'
+                set { engLead: waits.leads.data.groups[0].members[0] }    ->  InDevelopment
+
+    PendingAll:     status: Pending approval
+      primary: Approval { group: approverGroup[data.form.primaryDomain], approveData: { engLead: user } }
+      others:  Approval { over: data.form.otherDomains, group: approverGroup[item] }
+      transitions:
+        t_reject: when primary.rejected || others.rejected                ->  Rejected
+        t_accept: when primary.approved && others.approved
+                  set { engLead: primary.data.engLead }                   ->  InDevelopment
+
+    PendingPrimary: status: Pending approval
+      primary: Approval { group: approverGroup[data.form.primaryDomain], approveData: { engLead: user } }
+      others:  Approval { over: data.form.otherDomains, group: approverGroup[item],
+                          optional: true, notify: true }
+      transitions:
+        t_reject: when primary.rejected                                   ->  Rejected
+        t_accept: when primary.approved
+                  set { engLead: primary.data.engLead }                   ->  InDevelopment
+
+    InDevelopment:  requires: [engLead]
+      release: Task { assignee: user data.engLead, outcomes: [released] }
+      transitions:
+        t_release: when waits.release.task.outcome == 'released'          ->  Released
+
+    Released: final
+    Rejected: final
+```
+
+## Published elements
+
+| Stage | Waits, in declared order | Notification rules |
+|---|---|---|
+| Route | none | |
+| AssignLead | `leads` (call) | |
+| PendingAll | `primary.members` (call), `primary.decision`, `others.members` (call), `others.decision[item]` | `PendingAll.primary.noApprover`, `PendingAll.others.noApprover` |
+| PendingPrimary | `primary.members` (call), `primary.decision`, `others.decision[item]` (option) | `PendingPrimary.primary.noApprover`, `PendingPrimary.others.notify` |
+| InDevelopment | `release.task` | |
+| every stage | | `n_task` (default) |
+
+## Notes
+
+- **Route** is never seen: its transition fires in the turn that starts the request.
+- **AssignLead** lasts as long as the directory call. If the call fails, or the group is empty (`members[0]` is an expression error), the request faults. Either way an admin fixes it in one admin turn: clear the fault and jump to AssignLead again (the directory is asked afresh), or set the eng lead and jump to InDevelopment.
+- **Cancelling the others' actions** needs nothing on the transition: leaving a stage cancels the waits still open in it.
+- **No eligible approver** never blocks submission. The request waits, and the `noApprover` rule alerts the workflow admins.
+- **In PendingAll, `others.members` is opened even with no other domains** (an empty group list), because the expansion is static.
+
+## Open
+
+- May one person in two domains' approver groups approve for both? Assumed yes.
+- "First member" depends on the order the directory returns.
+===\n./workflows/change-request/test-cases.yaml\n===
+# Test cases for the change request, against kernel/kernel-spec.md v2.9.
+#
+# These are data, not code. Each case is: a list of inputs, and for each input either the exact
+# events the engine must append (in order) or a refusal. No harness exists yet.
+#
+# Conventions
+# - The definition under test is definition.md, next to this file.
+# - Element IDs are <composite instance>.<local name>: primary.decision, others.members, release.task.
+# - Activation IDs are symbolic: a1 is the root, a2 is Route, a3 the next stage entered, and so on.
+# - A wait is written <stage>.<element>[<foreach key>]@<activation>. seq is 1 everywhere and omitted.
+# - Envelope fields (requestId, seq, at, turn, v, engineBuild) are not listed. `turn` of every
+#   event in a block is the seq of that block's first event.
+# - Payload fields not listed are not asserted.
+# - `by: rita` is short for { type: user, id: rita }; `by: "connector:directory"` for
+#   { type: connector, id: directory }; `by: "system:engine"` for { type: system, id: engine }.
+# - `patch: { engLead: lee }` is short for [ { op: set, path: engLead, value: lee } ].
+# - `notify` lists the notification rules the notifier must match for that turn. It is checked
+#   against the notifier, not the engine: notifications are not history events.
+#
+# Paths are chosen by the primary domain. T1 to T7b: primary A, all domains approve (PendingAll).
+# T8 to T10: any other primary, the primary alone decides (PendingPrimary). T11 and T12: primary D, no approval (AssignLead).
+
+fixtures:
+  constants:
+    approverGroup: { A: grp-a, B: grp-b, C: grp-c }
+    engLeadGroup: { D: grp-d-leads }
+    allApprovalDomains: [A]          # A plays the platform domain
+    noApprovalDomains: [D]
+  directory:
+    grp-a: [alice, rita]
+    grp-b: [bob]
+    grp-c: []
+    grp-d-leads: [lee, lara]
+  people: { requester: rita, engLead: lee, admin: root-admin }
+  membersA: &members_a { groups: [ { id: grp-a, members: [alice, rita] } ] }
+  membersB: &members_b { groups: [ { id: grp-b, members: [bob] } ] }
+  membersC: &members_c { groups: [ { id: grp-c, members: [] } ] }
+  leadsD: &leads_d { groups: [ { id: grp-d-leads, members: [lee, lara] } ] }
+  leadsEmpty: &leads_empty { groups: [ { id: grp-d-leads, members: [] } ] }
+
+# Shared turns.
+openings:
+  # Primary domain A (all domains approve), one other domain B.
+  start_ab: &start_ab
+    input: { start: { by: rita, input: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start, patch: { form: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+      - [StageEntered, { activation: a2, stage: Route, parentActivation: a1 }]
+      - [TransitionFired, { transition: t_all, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: PendingAll, parentActivation: a1 }]
+      - [WaitOpened, { wait: PendingAll.primary.members@a3, kind: call, connector: directory, op: membersOf, args: { groups: [grp-a] } }]
+      - [WaitOpened, { wait: PendingAll.primary.decision@a3, kind: person, role: obligation, assignees: ["group:grp-a"] }]
+      - [WaitOpened, { wait: PendingAll.others.members@a3, kind: call, connector: directory, op: membersOf, args: { groups: [grp-b] } }]
+      - [WaitOpened, { wait: "PendingAll.others.decision[B]@a3", kind: person, role: obligation, assignees: ["group:grp-b"] }]
+    notify: [n_task, n_task]
+  # Primary domain A (all domains approve), one other domain C whose group is empty.
+  start_ac: &start_ac
+    input: { start: { by: rita, input: { title: "New dashboard", primaryDomain: A, otherDomains: [C] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Route }]
+      - [TransitionFired, { transition: t_all, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: PendingAll }]
+      - [WaitOpened, { wait: PendingAll.primary.members@a3, args: { groups: [grp-a] } }]
+      - [WaitOpened, { wait: PendingAll.primary.decision@a3 }]
+      - [WaitOpened, { wait: PendingAll.others.members@a3, args: { groups: [grp-c] } }]
+      - [WaitOpened, { wait: "PendingAll.others.decision[C]@a3", assignees: ["group:grp-c"] }]
+  primary_members_ok: &primary_members_ok
+    input: { callResult: { wait: PendingAll.primary.members@a3, outcome: ok, data: *members_a } }
+    expect:
+      - [WaitCompleted, { wait: PendingAll.primary.members@a3, outcome: ok, by: "connector:directory" }]
+    notify: []          # alice can approve; rita is the requester
+  others_members_b_ok: &others_members_b_ok
+    input: { callResult: { wait: PendingAll.others.members@a3, outcome: ok, data: *members_b } }
+    expect:
+      - [WaitCompleted, { wait: PendingAll.others.members@a3, outcome: ok, by: "connector:directory" }]
+    notify: []
+  others_members_c_ok: &others_members_c_ok
+    input: { callResult: { wait: PendingAll.others.members@a3, outcome: ok, data: *members_c } }
+    expect:
+      - [WaitCompleted, { wait: PendingAll.others.members@a3, outcome: ok, by: "connector:directory" }]
+    notify: [PendingAll.others.noApprover]
+  # Primary domain B (the primary alone decides), one other domain A.
+  start_domain_ab: &start_domain_ab
+    input: { start: { by: rita, input: { title: "Add column", primaryDomain: B, otherDomains: [A] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Route }]
+      - [TransitionFired, { transition: t_domain, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: PendingPrimary }]
+      - [WaitOpened, { wait: PendingPrimary.primary.members@a3, args: { groups: [grp-b] } }]
+      - [WaitOpened, { wait: PendingPrimary.primary.decision@a3, role: obligation, assignees: ["group:grp-b"] }]
+      - [WaitOpened, { wait: "PendingPrimary.others.decision[A]@a3", role: option, assignees: ["group:grp-a"] }]
+    notify: [n_task, PendingPrimary.others.notify]     # no members call and no noApprover rule for the optional approval
+  # No-approval domain D.
+  start_d: &start_d
+    input: { start: { by: rita, input: { title: "Fix label", primaryDomain: D, otherDomains: [] } } }
+    expect:
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Route }]
+      - [TransitionFired, { transition: t_skip, activation: a2 }]
+      - [StageExited, { activation: a2, mode: normal }]
+      - [StageEntered, { activation: a3, stage: AssignLead }]
+      - [WaitOpened, { wait: AssignLead.leads@a3, kind: call, connector: directory, op: membersOf, args: { groups: [grp-d-leads] } }]
+    notify: []          # nobody is asked to approve
+
+cases:
+
+  - id: T1
+    name: All-approve path, happy path with one other domain
+    turns:
+      - *start_ab
+      - *primary_members_ok
+      - *others_members_b_ok
+      - input: { act: { by: bob, wait: "PendingAll.others.decision[B]@a3", outcome: approve, data: {} } }
+        expect:
+          - [WaitCompleted, { wait: "PendingAll.others.decision[B]@a3", outcome: approve, by: bob, evidence: { memberOf: [grp-b] } }]
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.decision@a3, outcome: approve, by: alice, evidence: { memberOf: [grp-a] } }]
+          - [TransitionFired, { transition: t_accept, activation: a3 }]
+          - [DataSet, { source: transition, element: t_accept, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, kind: person, role: obligation, assignees: ["user:lee"] }]
+        notify: [n_task]
+      - input: { act: { by: lee, wait: InDevelopment.release.task@a4, outcome: released, data: {} } }
+        expect:
+          - [WaitCompleted, { wait: InDevelopment.release.task@a4, outcome: released, by: lee }]
+          - [TransitionFired, { transition: t_release, activation: a4 }]
+          - [StageExited, { activation: a4, mode: normal }]
+          - [StageEntered, { activation: a5, stage: Released, parentActivation: a1 }]
+          - [RequestClosed, { stage: Released }]
+
+  - id: T2
+    name: All-approve path, no other domains; the primary approval alone accepts
+    turns:
+      - input: { start: { by: rita, input: { title: "Tune alert", primaryDomain: A, otherDomains: [] } } }
+        expect:
+          - [RequestStarted, { by: rita }]
+          - [DataSet, { source: start }]
+          - [StageEntered, { activation: a1, stage: root }]
+          - [StageEntered, { activation: a2, stage: Route }]
+          - [TransitionFired, { transition: t_all, activation: a2 }]
+          - [StageExited, { activation: a2, mode: normal }]
+          - [StageEntered, { activation: a3, stage: PendingAll }]
+          - [WaitOpened, { wait: PendingAll.primary.members@a3, args: { groups: [grp-a] } }]
+          - [WaitOpened, { wait: PendingAll.primary.decision@a3 }]
+          - [WaitOpened, { wait: PendingAll.others.members@a3, args: { groups: [] } }]   # opened even for an empty list; no others.decision waits
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.decision@a3, outcome: approve, by: alice }]
+          - [TransitionFired, { transition: t_accept, activation: a3 }]
+          - [DataSet, { source: transition, patch: { engLead: lee } }]
+          - [WaitCancelled, { wait: PendingAll.primary.members@a3, cause: stage exit }]   # both directory calls were still in flight
+          - [WaitCancelled, { wait: PendingAll.others.members@a3, cause: stage exit }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4 }]
+      - input: { callResult: { wait: PendingAll.primary.members@a3, outcome: ok, data: *members_a } }
+        expect:
+          - [CallResultLate, { wait: PendingAll.primary.members@a3, outcome: ok }]
+        notify: []          # a late result does not trigger a no-approver rule
+
+  - id: T3
+    name: All-approve path, a domain has no eligible approver; the request is submitted and waits
+    turns:
+      - *start_ac
+      - *primary_members_ok
+      - *others_members_c_ok
+    finalState: { activeStages: [root, PendingAll], open: [PendingAll.primary.decision@a3, "PendingAll.others.decision[C]@a3"], faulted: false }
+
+  - id: T4
+    name: Refused attempts write nothing to history
+    turns:
+      - *start_ab
+      - input: { act: { by: rita, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        refuse: { reason: may }              # rita is in grp-a but is the requester
+        expect: []
+      - input: { act: { by: bob, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        refuse: { reason: not-assignee }     # bob is not in grp-a
+        expect: []
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: {} } }
+        refuse: { reason: invalid-data }     # engLead is required to approve
+        expect: []
+
+  - id: T5
+    name: All-approve path, one rejection rejects the request and cancels the approvals still open
+    turns:
+      - *start_ab
+      - *primary_members_ok
+      - *others_members_b_ok
+      - input: { act: { by: bob, wait: "PendingAll.others.decision[B]@a3", outcome: reject, data: { reason: "Out of scope" } } }
+        expect:
+          - [WaitCompleted, { wait: "PendingAll.others.decision[B]@a3", outcome: reject, by: bob }]
+          - [TransitionFired, { transition: t_reject, activation: a3 }]
+          - [WaitCancelled, { wait: PendingAll.primary.decision@a3, cause: stage exit }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: Rejected, parentActivation: a1 }]
+          - [RequestClosed, { stage: Rejected }]
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        refuse: { reason: wait-not-open }
+        expect: []
+
+  - id: T6
+    name: Admin skips a domain's approval and jumps, in one turn
+    turns:
+      - *start_ac
+      - *primary_members_ok
+      - *others_members_c_ok
+      - input: { act: { by: alice, wait: PendingAll.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.decision@a3, outcome: approve, by: alice }]   # t_accept is false: others.decision[C] is open
+      - input:
+          admin:
+            by: root-admin
+            reason: "Domain C has no approvers; approved out of band, ticket OPS-1"
+            actions:
+              - { skip: "PendingAll.others.decision[C]@a3" }
+              - { setData: { engLead: lee } }
+              - { jump: { from: PendingAll, to: InDevelopment } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [WaitSkipped, { wait: "PendingAll.others.decision[C]@a3" }]
+          - [DataSet, { source: admin, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+
+  - id: T6b
+    name: A skip alone decides nothing and leaves the request stuck
+    turns:
+      - same-as: T6 turns 1 to 4
+      - input:
+          admin: { by: root-admin, reason: "Domain C has no approvers", actions: [ { skip: "PendingAll.others.decision[C]@a3" } ], waived: [] }
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [WaitSkipped, { wait: "PendingAll.others.decision[C]@a3" }]
+          - [Faulted, { kind: stuck }]       # t_accept stays false; no obligation or call is open
+    finalState: { activeStages: [root, PendingAll], open: [], faulted: true }
+
+  - id: T7
+    name: Admin jumps while the directory calls are in flight
+    turns:
+      - *start_ab
+      - input:
+          admin:
+            by: root-admin
+            reason: "Sev1 hotfix"
+            actions:
+              - { setData: { engLead: lee } }
+              - { jump: { from: PendingAll, to: InDevelopment } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [DataSet, { source: admin, patch: { engLead: lee } }]
+          - [WaitSkipped, { wait: PendingAll.primary.members@a3 }]
+          - [WaitSkipped, { wait: PendingAll.primary.decision@a3 }]
+          - [WaitSkipped, { wait: PendingAll.others.members@a3 }]
+          - [WaitSkipped, { wait: "PendingAll.others.decision[B]@a3" }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4 }]
+      - input: { callResult: { wait: PendingAll.primary.members@a3, outcome: ok, data: *members_a } }
+        expect:
+          - [CallResultLate, { wait: PendingAll.primary.members@a3, outcome: ok }]
+
+  - id: T7b
+    name: A jump without the data the target stage requires is refused
+    turns:
+      - *start_ab
+      - input:
+          admin: { by: root-admin, reason: "Sev1 hotfix", actions: [ { jump: { from: PendingAll, to: InDevelopment } } ], waived: [] }
+        refuse: { reason: requires-not-met, paths: [engLead] }
+        expect: []
+
+  - id: T8
+    name: A CEL error rolls the turn back and faults the request
+    turns:
+      - input: { start: { by: rita, input: { title: "Typo domain", primaryDomain: Z, otherDomains: [] } } }
+        expect:
+          - [RequestStarted, { by: rita }]
+          - [Faulted, { kind: error, element: PendingPrimary.primary.members }]    # approverGroup has no key Z; the routing is rolled back too
+      - input:
+          admin: { by: root-admin, reason: "Unknown domain; requester to resubmit", actions: [ { close: {} } ], waived: [] }
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [RequestClosed, { by: admin }]
+    finalState: { activeStages: [], open: [], closed: true }
+
+  - id: T9
+    name: Domain path, another domain's decision has no effect; the primary alone accepts
+    turns:
+      - *start_domain_ab
+      - input: { callResult: { wait: PendingPrimary.primary.members@a3, outcome: ok, data: *members_b } }
+        expect:
+          - [WaitCompleted, { wait: PendingPrimary.primary.members@a3, outcome: ok, by: "connector:directory" }]
+        notify: []
+      - input: { act: { by: alice, wait: "PendingPrimary.others.decision[A]@a3", outcome: reject, data: { reason: "Not keen" } } }
+        expect:
+          - [WaitCompleted, { wait: "PendingPrimary.others.decision[A]@a3", outcome: reject, by: alice }]   # recorded; no transition reads it
+      - input: { act: { by: bob, wait: PendingPrimary.primary.decision@a3, outcome: approve, data: { engLead: lee } } }
+        expect:
+          - [WaitCompleted, { wait: PendingPrimary.primary.decision@a3, outcome: approve, by: bob }]
+          - [TransitionFired, { transition: t_accept, activation: a3 }]
+          - [DataSet, { source: transition, element: t_accept, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+        notify: [n_task]
+
+  - id: T10
+    name: Domain path, the primary's decision closes the other domains' open actions
+    turns:
+      - *start_domain_ab
+      - input: { act: { by: bob, wait: PendingPrimary.primary.decision@a3, outcome: reject, data: { reason: "Duplicate" } } }
+        expect:
+          - [WaitCompleted, { wait: PendingPrimary.primary.decision@a3, outcome: reject, by: bob }]
+          - [TransitionFired, { transition: t_reject, activation: a3 }]
+          - [WaitCancelled, { wait: PendingPrimary.primary.members@a3, cause: stage exit }]
+          - [WaitCancelled, { wait: "PendingPrimary.others.decision[A]@a3", cause: stage exit }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: Rejected, parentActivation: a1 }]
+          - [RequestClosed, { stage: Rejected }]
+      - input: { act: { by: alice, wait: "PendingPrimary.others.decision[A]@a3", outcome: approve, data: {} } }
+        refuse: { reason: wait-not-open }
+        expect: []
+
+  - id: T11
+    name: No-approval path, the eng lead is the first member of the domain's eng-lead group
+    turns:
+      - *start_d
+      - input: { callResult: { wait: AssignLead.leads@a3, outcome: ok, data: *leads_d } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a3, outcome: ok, by: "connector:directory" }]
+          - [TransitionFired, { transition: t_lead, activation: a3 }]
+          - [DataSet, { source: transition, element: t_lead, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: normal }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+        notify: [n_task]    # the only notification on this path
+
+  - id: T12
+    name: No-approval path, an empty eng-lead group faults; an admin retries by re-entering the stage
+    turns:
+      - *start_d
+      - input: { callResult: { wait: AssignLead.leads@a3, outcome: ok, data: *leads_empty } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a3, outcome: ok, by: "connector:directory" }]
+          - [Faulted, { kind: error, element: t_lead }]      # members[0] on an empty list
+      - input:
+          admin:
+            by: root-admin
+            reason: "Eng-lead group for D was empty; fixed in the directory"
+            actions:
+              - { clearFault: {} }
+              - { jump: { from: AssignLead, to: AssignLead } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: AssignLead, parentActivation: a1 }]
+          - [WaitOpened, { wait: AssignLead.leads@a4, kind: call }]     # a new read; t_lead is false while it is open
+      - input: { callResult: { wait: AssignLead.leads@a4, outcome: ok, data: *leads_d } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a4, outcome: ok }]
+          - [TransitionFired, { transition: t_lead, activation: a4 }]
+          - [DataSet, { source: transition, element: t_lead, patch: { engLead: lee } }]
+          - [StageExited, { activation: a4, mode: normal }]
+          - [StageEntered, { activation: a5, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a5 }]
+
+  - id: T12b
+    name: No-approval path, an admin bypasses the lookup by setting the eng lead
+    turns:
+      - same-as: T12 turns 1 to 2
+      - input:
+          admin:
+            by: root-admin
+            reason: "Eng-lead group for D is empty; lee confirmed by email"
+            actions:
+              - { clearFault: {} }
+              - { setData: { engLead: lee } }
+              - { jump: { from: AssignLead, to: InDevelopment } }
+            waived: []
+        expect:
+          - [Overridden, { by: root-admin }]
+          - [DataSet, { source: admin, patch: { engLead: lee } }]
+          - [StageExited, { activation: a3, mode: forced }]
+          - [StageEntered, { activation: a4, stage: InDevelopment, parentActivation: a1 }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a4, assignees: ["user:lee"] }]
+
+  - id: T12c
+    name: No-approval path, a failed directory lookup faults; an admin retries by re-entering the stage
+    turns:
+      - *start_d
+      - input: { callResult: { wait: AssignLead.leads@a3, outcome: failed, data: { error: "group not found" } } }
+        expect:
+          - [WaitCompleted, { wait: AssignLead.leads@a3, outcome: failed, by: "connector:directory" }]
+          - [Faulted, { kind: error, element: AssignLead.leads }]      # leads has no onFailure: outcome
+      - same-as: T12 turns 3 to 4
+
+  - id: T3b
+    name: All-approve path, a failed membership check does not stop the request
+    turns:
+      - *start_ab
+      - input: { callResult: { wait: PendingAll.primary.members@a3, outcome: failed, data: { error: "directory unavailable" } } }
+        expect:
+          - [WaitCompleted, { wait: PendingAll.primary.members@a3, outcome: failed, by: "connector:directory" }]   # onFailure: outcome; no fault
+        notify: [PendingAll.primary.noApprover]
+    finalState: { activeStages: [root, PendingAll], faulted: false }

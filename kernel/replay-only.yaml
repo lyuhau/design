@@ -1,5 +1,5 @@
-# Replay-only cases, against kernel-spec.md v2.7.
-# `by` shorthand is as in c1-change-request.yaml.
+# Replay-only cases, against kernel-spec.md v2.9.
+# `by` shorthand is as in workflows/change-request/test-cases.yaml.
 #
 # The MVP's `decide` never produces these histories. Each case checks that `evolve` can replay a
 # history that uses an insurance field, so the field is not dropped. Given the events, replay must
