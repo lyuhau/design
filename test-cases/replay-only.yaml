@@ -1,0 +1,50 @@
+# Replay-only cases, against kernel-spec.md v2.4.
+#
+# The MVP's `decide` never produces these histories. Each case checks that `evolve` can replay a
+# history that uses an insurance field, so the field is not dropped. Given the events, replay must
+# produce the expected state.
+
+cases:
+
+  - id: R1
+    name: Two child stages active at once (battery P4)
+    needs: [StageEntered.parentActivation, "active stages stored as a set"]
+    history:
+      - [RequestStarted, { by: rita }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+      - [StageEntered, { activation: a2, stage: Legal, parentActivation: a1 }]
+      - [StageEntered, { activation: a3, stage: Security, parentActivation: a1 }]
+      - [WaitOpened, { wait: Legal.review@a2, kind: person, role: obligation }]
+      - [WaitOpened, { wait: Security.review@a3, kind: person, role: obligation }]
+      - [WaitCompleted, { wait: Legal.review@a2, outcome: approve, by: lena }]
+      - [StageExited, { activation: a2, mode: normal }]
+    expectState:
+      activeStages: [ { activation: a1, stage: root }, { activation: a3, stage: Security, parent: a1 } ]
+      open: [Security.review@a3]
+
+  - id: R2
+    name: A second instance of the same wait in one stage entry (battery C3)
+    needs: [wait ID seq]
+    history:
+      - [RequestStarted, { by: rita }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+      - [StageEntered, { activation: a2, stage: PendingApproval, parentActivation: a1 }]
+      - [WaitOpened, { wait: "PendingApproval.items[lineage]@a2", seq: 1, kind: person }]
+      - [WaitOpened, { wait: PendingApproval.approval@a2, seq: 1, kind: person }]
+      - [WaitCompleted, { wait: "PendingApproval.items[lineage]@a2", seq: 1, outcome: done, by: cara }]
+      - [WaitOpened, { wait: "PendingApproval.items[lineage]@a2", seq: 2, kind: person }]
+    expectState:
+      activeStages: [ { activation: a1, stage: root }, { activation: a2, stage: PendingApproval, parent: a1 } ]
+      waits:
+        - { wait: "PendingApproval.items[lineage]@a2", seq: 1, status: completed }
+        - { wait: "PendingApproval.items[lineage]@a2", seq: 2, status: open }
+        - { wait: PendingApproval.approval@a2, seq: 1, status: open }
+
+  - id: R3
+    name: A child request records its parent (battery P1, P2)
+    needs: [RequestStarted.parent]
+    history:
+      - [RequestStarted, { by: "system:engine", parent: { requestId: req-100, wait: Build.start@a4 } }]
+      - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
+    expectState:
+      parent: { requestId: req-100, wait: Build.start@a4 }
