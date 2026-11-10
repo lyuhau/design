@@ -1,4 +1,4 @@
-# Workflow engine kernel: spec v2.4
+# Workflow engine kernel: spec v2.7
 
 Status: proposal. The design doc summarises it; this file is the reference.
 
@@ -24,7 +24,7 @@ The change-request workflow is the refactor of the existing Change Management pr
 | `foreach` | Yes, on person waits | On other wait kinds |
 | Set | Yes | |
 | Notification rules | Yes | |
-| Publish through the API | Yes (a JSON POST; no composite library, one hand-written approval expansion) | Composite registry |
+| Publish through the API | Yes (a JSON POST; composites are code and expand at publish, section 7) | Composite registry |
 
 The event vocabulary is provisional until a second use case has been built against it. Every event carries a schema version so shapes can be upcast.
 
@@ -42,8 +42,9 @@ The event vocabulary is provisional until a second use case has been built again
 - `otherwise` is a built-in condition: every wait of this stage is `completed` and no other transition is enabled. A skipped wait never satisfies it.
 - Order: root transitions first, then the child stage's, in declared order. First true one fires.
 
-**Wait.** ID = `(element, activation, key, seq)`; `seq` is always 1 in the MVP (battery C3). Lifecycle: `open -> completed | cancelled | skipped`.
-- In CEL every wait in scope is always readable as `waits.<name>` = `{status, outcome, by}`; `outcome` is `""` unless completed; `by` is the ID of the person or connector that completed it. `waits.<name>.data` may be read only under a guard on that wait's outcome; the publish check enforces it.
+**Wait.** ID = `(element, activation, key, seq)`. Lifecycle: `open -> completed | cancelled | skipped`.
+- `seq` is an ordinal per `(element, activation, key)`, whatever caused the new instance. The highest `seq` is the current instance, for every wait kind, in `evolve` and in CEL. The MVP's `decide` only ever writes 1, but no code may assume `seq` is 1, that one instance exists, or that a predecessor completed (battery C3, I1). A repeated write call's idempotency key includes `seq`.
+- In CEL every wait in scope is always readable as `waits.<element ID>` (for example `waits.primary.decision`) = `{status, outcome, by}`; `outcome` is `""` unless completed; `by` is who completed it, `{type, id}`. `waits.<name>.data` may be read only under a guard on that wait's outcome; the publish check enforces it.
 - *Person:* `assignees` (user and group references, recorded at open, not expanded), `may` (optional CEL, default true; reads `data`, `request`, `actor`, waits in scope), `outcomes` (enum, each with a data schema), `role: obligation | option`. At act time the engine looks up the actor's memberships, checks `assignees` and `may`, validates data, and records the lookup as evidence. A refused attempt changes nothing and goes to an attempts log outside history.
 - *Call:* `connector`, `op`, `args`, `effect: read | write`, optional `idempotencyKey`. Outcome `ok` or `failed`. Default idempotency key: reads are per activation (re-entry reads again); writes are per request. The pending call is written in the same transaction as the event that opened it; a dispatcher delivers at least once, and a reconciler re-queues anything open with no delivery in flight.
 - *Connector obligations:* honour the key. For a key that already succeeded, return that result and do nothing else (look up by key before creating if the external system has no idempotency support). For a key that failed, try again. Never report a timeout or "don't know" as `failed`; keep the call pending. An author who wants a retry with different arguments sets an explicit key.
@@ -51,7 +52,7 @@ The event vocabulary is provisional until a second use case has been built again
 
 **Set.** Writes to the request's data document, only on a transition, on start, or by an admin.
 
-**CEL context.** `data`; `request` = `{id, by, at}` (`by` is the starter's ID); `actor` = `{id}` (in `may` only); `waits` for the current activations of the root and the active child. Earlier activations are invisible. There is no clock. Anything that must persist goes through Set.
+**CEL context.** `data`; `request` = `{id, by, at}` (`by` is the starter, `{type, id}`); `actor` = `{type, id}` (in `may` only); `waits` for the current activations of the root and the active child. Earlier activations are invisible. There is no clock. Anything that must persist goes through Set.
 
 Waits on the root stage are open for the whole life of the request and are cancelled when it closes. The change request does not use them.
 
@@ -85,7 +86,12 @@ There is no event that rewrites an earlier one. A wrong completion stays in hist
 
 ## 5. Event vocabulary
 
-Envelope on every event: `requestId`, `seq`, `at` (the only clock), `turn` (seq of the input that caused it), `v` (schema version of this event type), `engineBuild`. Events name definition elements by stable ID; the published definition maps each element to the composite it came from.
+Envelope on every event: `requestId`, `seq`, `at` (the only clock), `turn`, `v` (schema version of this event type), `engineBuild`. Events name definition elements by stable ID; the published definition maps each element to the composite instance it came from (section 7, composites).
+
+- `turn` is the seq of the input that caused the event, even when `decide` ran later, after an admin cleared a fault.
+- `by` is always a typed value: `{type: user | connector | system, id}`.
+- Payload enums (`DataSet.source`, `WaitCancelled.cause`, `Faulted.kind`, `StageExited.mode`, wait `kind` and `role`) are open: `evolve` never branches on them, and values may be added.
+- A patch is an ordered list of `{op: set | remove, path, value}`. `set` replaces the value at the path; there is no merge and no array position. A collection that is edited per item is a map keyed by ID.
 
 | Kind | Event | Payload |
 |---|---|---|
@@ -99,7 +105,7 @@ Envelope on every event: `requestId`, `seq`, `at` (the only clock), `turn` (seq 
 | Decision | `WaitOpened` | wait (element, activation, key, seq), kind, role, resolved params (assignees and schemas; or connector, op, args, idempotency key; kind child, reserved: `request`, `onCancel`; battery P1 to P3) |
 | Decision | `WaitCancelled` | wait, cause: stage exit or request closed |
 | Decision | `WaitSkipped` | wait |
-| Decision | `DataSet` | patch, source: start, transition or admin |
+| Decision | `DataSet` | patch, source: start, transition or admin (`wait` reserved), `element` (optional: the transition or wait whose Set wrote it) |
 | Decision | `Faulted` | kind: error or stuck, element, error |
 | Decision | `RequestClosed` | final stage, or closed by admin |
 | Decision | `RequestReopened` | stage |
@@ -137,6 +143,10 @@ notifications:
 
 Other contracts:
 - The published definition format and its CEL environment are a second long-lived contract: the engine must be able to run `decide` for a definition version for as long as a request on it is open.
+- Composites are expanded at publish; history never names one. A later migration finds the composite through the definition (history -> definition version -> element -> composite instance). Replay still never reads the definition. Three rules keep that lookup usable:
+  - An expanded element's ID is the composite instance ID plus a local name (`primary.decision`, `primary.members`), never positional. It stays the same across composite versions when the element means the same thing.
+  - The published definition records, for each composite instance: composite name, composite version, and the parameters used.
+  - Any change to a composite's expansion needs a new composite version. In the MVP composites are code: a build test compares each expansion with a stored copy and fails if it changed without a version bump.
 - Action-item list = open person waits with `role: obligation` whose assignees name the viewer or a group they belong to now. Options show on the request page only.
 
 ## 8. Reserved features (not built in the MVP)
@@ -161,7 +171,17 @@ Other contracts:
 - A workflow-level emergency override is a second outcome on the same wait, with fewer checks and a mandatory comment as its data. It is separate from the platform admin override.
 - Known limit: the publish check cannot prove a gate is passable, and the stuck check will not catch an unpassable one, because an obligation is still open.
 
-**Repeatable waits** (battery C3). A second instance of the same wait within one stage entry takes the next `seq`. Nothing else is specified yet.
+**Repeatable waits** (battery C3, I1). A person wait that can be completed many times in one stage entry: a checkbox, a field edit. No new event type.
+- Each completion records `WaitCompleted`, then `DataSet{source: wait, element}` from the wait's own Set, then opens the next instance (next `seq`) last, and only if the stage is still active.
+- The Set is mandatory. It reads the completion (`outcome`, `data`, `by`, `at`) and the `foreach` item. Writing an unchanged value still records a `DataSet`.
+- Conditions cannot read a repeatable wait (publish error). They read the data its Set wrote.
+- An optional `pending` condition (for example "this item is not ticked"). While true, the wait counts as an obligation in the stuck check, in `otherwise` and on the action-item list. While false, it is only an available action on the request page.
+- With `foreach`, each item has its own sequence, and the Set writes to a path keyed by the item.
+- An admin skip closes the current instance and opens no successor.
+- After a fault clears, the Set runs once per kept input.
+- "Confirmed since the last edit" is done by stamping the item with what it was confirmed against (a revision number), not by counting completions.
+- Transitions stay one-shot per stage entry.
+- Known limits: work on every occurrence, dismissing some approvals after an edit, a repeatable stage move, reassignment, adding to a `foreach` list, and question-and-answer as a real task. These need a completion that can open or replace waits and calls. That layer is not designed; it must be opt-in so it stays additive.
 
 ## 9. The change request
 
@@ -174,30 +194,35 @@ root:
   stages:
     Pending:
       waits:
-        members: call { connector: directory, op: membersOf, effect: read,
-                        args: { groups: ([data.form.primaryDomain] + data.form.otherDomains)
-                                          .map(d, approverGroup[d]) } }
-        primary: person { assignees: [group: approverGroup[data.form.primaryDomain]],
-                          may: actor.id != request.by, role: obligation,
-                          outcomes: { approve: { engLead: user }, reject: { reason: string } } }
-        others:  person { foreach: data.form.otherDomains,
-                          assignees: [group: approverGroup[item]],
-                          may: actor.id != request.by, role: obligation,
-                          outcomes: { approve: {}, reject: { reason: string } } }
+        primary.members:  call { connector: directory, op: membersOf, effect: read,
+                                 args: { groups: [approverGroup[data.form.primaryDomain]] } }
+        primary.decision: person { assignees: [group: approverGroup[data.form.primaryDomain]],
+                                   may: actor != request.by, role: obligation,
+                                   outcomes: { approve: { engLead: user }, reject: { reason: string } } }
+        others.members:   call { connector: directory, op: membersOf, effect: read,
+                                 args: { groups: data.form.otherDomains.map(d, approverGroup[d]) } }
+        others.decision:  person { foreach: data.form.otherDomains,
+                                   assignees: [group: approverGroup[item]],
+                                   may: actor != request.by, role: obligation,
+                                   outcomes: { approve: {}, reject: { reason: string } } }
       transitions:
-        t_reject: when waits.primary.outcome == 'reject'
-                       || waits.others.exists(w, w.outcome == 'reject')           ->  Rejected
-        t_accept: when waits.primary.outcome == 'approve'
-                       && waits.others.all(w, w.outcome == 'approve')
-                  set { engLead: waits.primary.data.engLead }                     ->  InDevelopment
+        t_reject: when waits.primary.decision.outcome == 'reject'
+                       || waits.others.decision.exists(w, w.outcome == 'reject')    ->  Rejected
+        t_accept: when waits.primary.decision.outcome == 'approve'
+                       && waits.others.decision.all(w, w.outcome == 'approve')
+                  set { engLead: waits.primary.decision.data.engLead }              ->  InDevelopment
     InDevelopment:  requires: [engLead]
-      waits:  release: person { assignees: [user: data.engLead], role: obligation, outcomes: [released] }
-      transitions:  t_release: when waits.release.outcome == 'released'  ->  Released
+      waits:  release.task: person { assignees: [user: data.engLead], role: obligation, outcomes: [released] }
+      transitions:  t_release: when waits.release.task.outcome == 'released'  ->  Released
     Released: final     Rejected: final
 notifications:
-  - id: n_no_approver
-    on:   WaitCompleted members
-    when: outcome == 'failed' || data.groups.exists(g, !g.members.exists(m, m != request.by))
+  - id: primary.noApprover
+    on:   WaitCompleted primary.members
+    when: outcome == 'failed' || data.groups.exists(g, !g.members.exists(m, m != request.by.id))
+    send: { template: alertAdmins, to: group: workflowAdmins }
+  - id: others.noApprover
+    on:   WaitCompleted others.members
+    when: (same as primary.noApprover)
     send: { template: alertAdmins, to: group: workflowAdmins }
   - id: n_task
     on:   WaitOpened
@@ -205,15 +230,17 @@ notifications:
     send: { template: newTask, to: assignees }
 ```
 
-No transition reads `members`. Its result is recorded so the notifier can alert admins when a domain has nobody able to approve; the request is submitted either way and waits.
+This is the published (expanded) form. It comes from three composite instances: `primary` and `others` (Approval) and `release` (Task). The composites themselves are described in the design doc, not here; the kernel only sees their expansion. Element IDs follow the rule in section 7. `others.members` is opened even when there are no other domains (an empty group list).
+
+No transition reads a `members` call. Its result is recorded so the notifier can alert admins when a domain has nobody able to approve; the request is submitted either way and waits.
 
 Happy path with one other domain (input first in each turn):
 
-1. `RequestStarted` · `DataSet` · `StageEntered root` · `StageEntered Pending` · `WaitOpened members` · `WaitOpened primary` · `WaitOpened others[domainB]`
-2. `WaitCompleted members ok`
-3. `WaitCompleted others[domainB] approve`
-4. `WaitCompleted primary approve {engLead}` · `TransitionFired t_accept` · `DataSet` · `StageExited Pending` · `StageEntered InDevelopment` · `WaitOpened release`
-5. `WaitCompleted release` · `TransitionFired t_release` · `StageExited InDevelopment` · `StageEntered Released` · `RequestClosed`
+1. `RequestStarted` · `DataSet` · `StageEntered root` · `StageEntered Pending` · `WaitOpened primary.members` · `WaitOpened primary.decision` · `WaitOpened others.members` · `WaitOpened others.decision[domainB]`
+2. `WaitCompleted primary.members ok`, then `WaitCompleted others.members ok` (one turn each)
+3. `WaitCompleted others.decision[domainB] approve`
+4. `WaitCompleted primary.decision approve {engLead}` · `TransitionFired t_accept` · `DataSet` · `StageExited Pending` · `StageEntered InDevelopment` · `WaitOpened release.task`
+5. `WaitCompleted release.task` · `TransitionFired t_release` · `StageExited InDevelopment` · `StageEntered Released` · `RequestClosed`
 
 The edge cases are the test cases in `test-cases/c1-change-request.yaml`.
 

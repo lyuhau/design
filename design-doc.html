@@ -128,7 +128,7 @@ dl.gloss dd { margin: 0; }
   <div class="meta">
     <span class="pill mvp">MVP: change request</span>
     <span class="pill plain">Next.js · Node · Postgres</span>
-    <span class="pill plain">Kernel spec v2.4</span>
+    <span class="pill plain">Kernel spec v2.7</span>
   </div>
 </header>
 
@@ -154,7 +154,7 @@ dl.gloss dd { margin: 0; }
     <tbody>
       <tr><td>The change request workflow, at parity with the existing product (with intentional exceptions where it is bad)</td><td>The five later use cases: tech debt initiatives, architecture review, metrics recertification, domain routing with Jira, metadata changes</td></tr>
       <tr><td>Multi-domain approval: every domain's approvers approve; the primary domain's approver picks the eng lead</td><td>Updating a request in flight to a newer definition (migrations)</td></tr>
-      <tr><td>Publishing a definition through the API and an admin page that accepts JSON</td><td>A visual workflow editor and a library of composites</td></tr>
+      <tr><td>Publishing a definition through the API and an admin page that accepts JSON</td><td>A visual workflow editor, and composites beyond Approval and Task</td></tr>
       <tr><td>Admin override and break-glass access</td><td>Timers, child requests, date-triggered starts</td></tr>
       <tr><td>Notifications through the existing email and Slack service</td><td>Attachments (no file storage yet)</td></tr>
       <tr><td>The form renderer for the intake form</td><td>Importing legacy requests</td></tr>
@@ -243,7 +243,7 @@ dl.gloss dd { margin: 0; }
   <p>A request has one primary domain and zero or more other domains, taken from the form. It only moves forward.</p>
   <div class="diagram">
     <div class="flow">
-      <div class="st"><b>Pending</b><span>One approval per domain. The primary domain's approver picks the eng lead to approve. A directory call records who can approve.</span></div>
+      <div class="st"><b>Pending</b><span>One approval per domain. The primary domain's approver picks the eng lead to approve. Each approval's directory call records who can approve.</span></div>
       <div class="ar">all approve</div>
       <div class="st"><b>In development</b><span>The eng lead marks the request released.</span></div>
       <div class="ar">released</div>
@@ -255,6 +255,28 @@ dl.gloss dd { margin: 0; }
     <li><strong>Submission never blocks.</strong> If a domain has nobody able to approve, the request still enters Pending and waits. A notification rule alerts the workflow admins from the recorded directory result.</li>
     <li><strong>Requesters cannot approve their own request.</strong> Group membership is checked when the person acts, and the lookup is recorded with the approval.</li>
     <li><strong>An admin can skip one domain's approval,</strong> but a skip never counts as an approval. To move the request on, the admin also jumps it forward and supplies the eng lead if nobody picked one.</li>
+  </ul>
+  <h3>Composites</h3>
+  <p>The definition is written with two composites. Each is code in the repository, has a version, and expands into kernel parts when the definition is published. History never names a composite; the published definition records which composite, version and parameters each element came from. An expanded element's ID is the composite instance's ID plus a local name (<code>primary.decision</code>, <code>primary.members</code>, <code>release.task</code>), and it stays the same across composite versions when the element means the same thing. That is what lets a later migration find the approval an old event belongs to.</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Composite</th><th>Parameters</th><th>Expands to</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Approval</strong></td><td><code>group</code>; <code>over</code> (optional list, one approval per item); <code>approveData</code>; <code>allowRequester</code> (default false); outcome names (default approve and reject)</td><td>A person wait marked as an obligation, the rule that the requester cannot act, the directory membership call, and the notification rule for "nobody is able to approve".</td></tr>
+      <tr><td><strong>Task</strong></td><td><code>assignee</code>; <code>outcomes</code> (default done); <code>doneData</code></td><td>One person wait marked as an obligation.</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><strong>An approval does not own a transition.</strong> It exposes two conditions, <code>approved</code> and <code>rejected</code>, and the workflow's own transitions decide what each one does. With <code>over</code>, <code>approved</code> means every item is approved and <code>rejected</code> means any item is rejected.</li>
+    <li><strong>The change request uses two approvals and one task:</strong> the primary domain's approval (with the eng lead as its approval data), an approval over the other domains, and the eng lead's release task.</li>
+    <li><strong>The new-task notification</strong> is a default rule on every definition, not a composite.</li>
+  </ul>
+  <h3>Example composite: domain approvals</h3>
+  <p>A third composite is built as a worked example of how to write one. It is a fork of Approval for a primary group plus other groups, and it is the route to take when a workflow needs something Approval's parameters do not cover: fork it, do not add parameters. The change request does not use it in the first release.</p>
+  <ul>
+    <li><strong>Parameters:</strong> <code>primaryGroup</code>; <code>otherGroups</code> (a list); <code>primaryApproveData</code>; <code>allowRequester</code> (default false); outcome names.</li>
+    <li><strong>Expands to:</strong> one directory call for all the groups (<code>members</code>), the primary's person wait (<code>primary</code>), one person wait per other group (<code>others</code>), and one "nobody is able to approve" rule (<code>noApprover</code>). Each ID is prefixed with the instance's ID.</li>
+    <li><strong>Exposes</strong> the same <code>approved</code> and <code>rejected</code> conditions as Approval, and declares the same kind, <code>approval</code>, so pages and reports treat it as an approval.</li>
+    <li><strong>What it shows a developer:</strong> derived element IDs, a version, the stored-expansion build test, a shared kind, and exposed conditions. Compared with two Approval instances it makes one directory call and sends one alert per request.</li>
   </ul>
   <p>The definition and the happy-path events are in section 9 of the kernel spec. Ten cases (happy path, no other domains, no eligible approver, refused attempts, rejection, admin skip and jump, a jump during an in-flight call, an expression error) are written as test data in <code>test-cases/c1-change-request.yaml</code>.</p>
   <p><span class="pill open">To confirm</span> Three assumptions about the existing product: approvals for all domains run in parallel; one rejection rejects the whole request; a person in two domains' groups may approve for both.</p>
@@ -282,7 +304,7 @@ dl.gloss dd { margin: 0; }
     <li>A saved draft of the intake form is not a request yet. It is checked against the latest version when submitted.</li>
     <li>Conditions and computed values use CEL. Approver routing by domain is a CEL lookup, not a separate decision-table feature.</li>
     <li>Publishing runs checks: expressions type-check, data is read only where it exists, every stage can reach a final stage, and every outcome leads somewhere. "Can never get stuck" cannot be proven in general; the runtime stuck check is the backstop.</li>
-    <li>The first release has one hand-written expansion for approvals. There is no composite library.</li>
+    <li>The first release has two composites, Approval and Task, and one example composite, all written as code (section 5). Changing what a composite expands to requires a new composite version; a build test compares each expansion with a stored copy and fails otherwise.</li>
   </ul>
   <p>The definition format and its CEL environment are a second long-lived contract: the engine must be able to run a version for as long as a request on it is open.</p>
 </section>
@@ -341,7 +363,7 @@ dl.gloss dd { margin: 0; }
     <tbody>
       <tr><td class="n">M0</td><td>Parity checklist</td><td>The existing product's behaviours are listed from its code, each marked keep or drop.</td></tr>
       <tr><td class="n">M1</td><td>Walking skeleton</td><td>The engine passes test case T1, and the request table rebuilds from events.</td></tr>
-      <tr><td class="n">M2</td><td>Change request behaviour</td><td>All cases in <code>test-cases/</code> pass, plus cases added from the parity checklist.</td></tr>
+      <tr><td class="n">M2</td><td>Change request behaviour</td><td>The Approval and Task composites are built, plus the domain-approvals example, each with a version and the stored-expansion build test. All cases in <code>test-cases/</code> pass, plus cases added from the parity checklist.</td></tr>
       <tr><td class="n">M3</td><td>The app</td><td>Intake form, request page, action items and admin pages work end to end.</td></tr>
       <tr><td class="n">M4</td><td>Operability</td><td>A staged incident is fixed through the admin pages alone, with no server access.</td></tr>
       <tr><td class="n">M5</td><td>Cutover</td><td>New requests start in the new system.</td></tr>
@@ -359,10 +381,10 @@ dl.gloss dd { margin: 0; }
       <tr><td><span class="pill later">Later</span> Child requests</td><td>Start another workflow, optionally wait for it, and let it outlive the stage that started it. Also the answer for a multi-step task inside a stage.</td><td>Tech debt initiatives, architecture review</td></tr>
       <tr><td><span class="pill later">Later</span> Timer waits</td><td>Make something happen when a time arrives.</td><td>Deadlines, reminders</td></tr>
       <tr><td><span class="pill later">Later</span> Act-time gates</td><td>Named checks per outcome, with messages, run when a person acts. They can read the time of the attempt.</td><td>Metric change control</td></tr>
-      <tr><td><span class="pill later">Later</span> Repeatable waits</td><td>A second instance of the same wait within one stage entry.</td><td>Checklists that can be un-ticked</td></tr>
+      <tr><td><span class="pill later">Later</span> Repeatable waits</td><td>An action a person can repeat within one stage entry, such as ticking a box or editing a field. Each use writes data.</td><td>Checklists that can be un-ticked</td></tr>
       <tr><td><span class="pill later">Later</span> In-flight updates</td><td>Moving a request to a newer definition version.</td><td>Architecture review</td></tr>
       <tr><td><span class="pill later">Later</span> Scheduling</td><td>Date-triggered starts and recurring duties, possibly as a separate "obligations" feature.</td><td>Metrics recertification</td></tr>
-      <tr><td><span class="pill later">Later</span> Workflow editor and composites</td><td>Owners configure workflows in a UI from ready-made parts.</td><td>Every later app</td></tr>
+      <tr><td><span class="pill later">Later</span> Workflow editor and more composites</td><td>Owners configure workflows in a UI from ready-made parts.</td><td>Every later app</td></tr>
     </tbody>
   </table></div>
   <p>The metric change-control requirements were expanded on paper as a second workflow. They fit the model with no new event type; they need act-time gates and child requests, and one loop (revise and re-approve) is a known weak spot to revisit when that workflow is built.</p>

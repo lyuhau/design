@@ -6,13 +6,14 @@ Cases the MVP builds have test cases as data in `test-cases/` (definition, input
 
 | Case | Workflow | Built in the MVP | Status | Test data |
 |---|---|---|---|---|
-| C1 | Change request | Yes | Passes on spec v2.4 | `test-cases/c1-change-request.yaml` (T1 to T8) |
+| C1 | Change request | Yes | Passes on spec v2.7 | `test-cases/c1-change-request.yaml` (T1 to T8) |
 | C2 | Metric change control | No | Expressible with reserved features; the revise-and-reapprove loop is a known weak spot | Paper |
 | C3 | Checklist item ticked, un-ticked, re-ticked | No | Representation only | `test-cases/replay-only.yaml` R2 |
 | P1 | Start without waiting, join later | No | Passes with child requests | Paper; R3 covers the parent field |
 | P2 | Work that survives a send-back | No | Passes with child requests | Paper; R3 |
 | P3 | Fan-out where each leg runs several steps | No | Passes with child requests | Paper |
 | P4 | Two stage paths active at once | No | Representation only | `test-cases/replay-only.yaml` R1 |
+| I1 | Ten repeated in-stage actions | No | 3 of 10 clean with repeatable waits; the rest need an undesigned layer; history is safe for all | Paper; reports in `instage-test/` |
 
 ## C1. Change request
 
@@ -62,6 +63,25 @@ In C2's Pending Approval, the Concierge ticks an item, un-ticks it, and ticks it
 Passes if: the history can hold a second instance of the same wait in the same stage entry (`seq` 2), and the AE approval is not reset.
 
 Needs: `seq` in the wait ID.
+
+## I1. Repeated in-stage actions
+
+Ten patterns, each expanded under three models: data-driven (an action is a validated write), event-driven (named events with handlers), and the hybrid in the spec (a repeatable wait with its own Set). A fourth agent tried to show that the history favours one model. Reports: `instage-test/`.
+
+1. Checkbox: tick, un-tick, re-tick; a gate needs all required items.
+2. Field edit, several times; the latest value is used.
+3. Question and answer while an approval stays open.
+4. Reassign an open task.
+5. Add or remove a reviewer mid-review.
+6. An edit that dismisses approvals already given.
+7. An external call on every use, with its result known to the workflow.
+8. Two people act on the same item at once.
+9. A correction; audit shows both values.
+10. A value derived from several in-stage actions.
+
+Result: the three models differ in the definition language, not in the history. Each action records the action and its data write, linked by `turn`; no old history becomes unreplayable under any model. From the hybrid, moving to data-driven needs no history change, and moving to event-driven needs only additions. The hybrid alone handles 3 of the 10 cleanly; the limits are listed in the spec, section 8.
+
+Needs: the patch format in `DataSet`; `DataSet.element` and source `wait`; open payload enums; `seq` as an ordinal with "highest is current"; `turn` as the causing input on the fault path; typed `by`.
 
 ## Child rules assumed (to be written into the spec as reserved)
 

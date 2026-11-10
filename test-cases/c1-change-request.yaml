@@ -1,15 +1,19 @@
-# Test cases for the change request (battery case C1), against kernel-spec.md v2.4.
+# Test cases for the change request (battery case C1), against kernel-spec.md v2.7.
 #
 # These are data, not code. Each case is: a list of inputs, and for each input either the exact
 # events the engine must append (in order) or a refusal. No harness exists yet.
 #
 # Conventions
 # - The definition under test is the one in kernel-spec.md section 9.
+# - Element IDs are <composite instance>.<local name>: primary.decision, others.members, release.task.
 # - Activation IDs are symbolic: a1 is the root, a2 the first child stage entered, and so on.
-# - A wait is written <stage>.<wait>[<foreach key>]@<activation>. seq is 1 everywhere and omitted.
+# - A wait is written <stage>.<element>[<foreach key>]@<activation>. seq is 1 everywhere and omitted.
 # - Envelope fields (requestId, seq, at, turn, v, engineBuild) are not listed. `turn` of every
 #   event in a block is the seq of that block's first event.
 # - Payload fields not listed are not asserted.
+# - `by: rita` is short for { type: user, id: rita }; `by: "connector:directory"` for
+#   { type: connector, id: directory }; `by: "system:engine"` for { type: system, id: engine }.
+# - `patch: { engLead: lee }` is short for [ { op: set, path: engLead, value: lee } ].
 # - `notify` lists the notification rules the notifier must match for that turn. It is checked
 #   against the notifier, not the engine: notifications are not history events.
 
@@ -21,17 +25,13 @@ fixtures:
     grp-b: [bob]
     grp-c: []
   people: { requester: rita, engLead: lee, admin: root-admin }
-  membersResult: &members_ab
-    groups:
-      - { id: grp-a, members: [alice, rita] }
-      - { id: grp-b, members: [bob] }
-  membersResultC: &members_ac
-    groups:
-      - { id: grp-a, members: [alice, rita] }
-      - { id: grp-c, members: [] }
+  membersA: &members_a { groups: [ { id: grp-a, members: [alice, rita] } ] }
+  membersB: &members_b { groups: [ { id: grp-b, members: [bob] } ] }
+  membersC: &members_c { groups: [ { id: grp-c, members: [] } ] }
 
-# Shared opening turn for a request with primary domain A and one other domain B.
+# Shared turns.
 openings:
+  # Primary domain A and one other domain B.
   start_ab: &start_ab
     input: { start: { by: rita, input: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }
     expect:
@@ -39,15 +39,38 @@ openings:
       - [DataSet, { source: start, patch: { form: { title: "Rotate keys", primaryDomain: A, otherDomains: [B] } } }]
       - [StageEntered, { activation: a1, stage: root, parentActivation: null }]
       - [StageEntered, { activation: a2, stage: Pending, parentActivation: a1 }]
-      - [WaitOpened, { wait: Pending.members@a2, kind: call, connector: directory, op: membersOf, args: { groups: [grp-a, grp-b] } }]
-      - [WaitOpened, { wait: Pending.primary@a2, kind: person, role: obligation, assignees: ["group:grp-a"] }]
-      - [WaitOpened, { wait: "Pending.others[B]@a2", kind: person, role: obligation, assignees: ["group:grp-b"] }]
+      - [WaitOpened, { wait: Pending.primary.members@a2, kind: call, connector: directory, op: membersOf, args: { groups: [grp-a] } }]
+      - [WaitOpened, { wait: Pending.primary.decision@a2, kind: person, role: obligation, assignees: ["group:grp-a"] }]
+      - [WaitOpened, { wait: Pending.others.members@a2, kind: call, connector: directory, op: membersOf, args: { groups: [grp-b] } }]
+      - [WaitOpened, { wait: "Pending.others.decision[B]@a2", kind: person, role: obligation, assignees: ["group:grp-b"] }]
     notify: [n_task, n_task]
-  members_ok: &members_ok
-    input: { callResult: { wait: Pending.members@a2, outcome: ok, data: *members_ab } }
+  # Primary domain A and one other domain C, whose group is empty.
+  start_ac: &start_ac
+    input: { start: { by: rita, input: { title: "New dashboard", primaryDomain: A, otherDomains: [C] } } }
     expect:
-      - [WaitCompleted, { wait: Pending.members@a2, outcome: ok, by: "connector:directory" }]
+      - [RequestStarted, { by: rita }]
+      - [DataSet, { source: start }]
+      - [StageEntered, { activation: a1, stage: root }]
+      - [StageEntered, { activation: a2, stage: Pending }]
+      - [WaitOpened, { wait: Pending.primary.members@a2, args: { groups: [grp-a] } }]
+      - [WaitOpened, { wait: Pending.primary.decision@a2 }]
+      - [WaitOpened, { wait: Pending.others.members@a2, args: { groups: [grp-c] } }]
+      - [WaitOpened, { wait: "Pending.others.decision[C]@a2", assignees: ["group:grp-c"] }]
+  primary_members_ok: &primary_members_ok
+    input: { callResult: { wait: Pending.primary.members@a2, outcome: ok, data: *members_a } }
+    expect:
+      - [WaitCompleted, { wait: Pending.primary.members@a2, outcome: ok, by: "connector:directory" }]
+    notify: []          # alice can approve; rita is the requester
+  others_members_b_ok: &others_members_b_ok
+    input: { callResult: { wait: Pending.others.members@a2, outcome: ok, data: *members_b } }
+    expect:
+      - [WaitCompleted, { wait: Pending.others.members@a2, outcome: ok, by: "connector:directory" }]
     notify: []
+  others_members_c_ok: &others_members_c_ok
+    input: { callResult: { wait: Pending.others.members@a2, outcome: ok, data: *members_c } }
+    expect:
+      - [WaitCompleted, { wait: Pending.others.members@a2, outcome: ok, by: "connector:directory" }]
+    notify: [others.noApprover]
 
 cases:
 
@@ -55,22 +78,23 @@ cases:
     name: Happy path with one other domain
     turns:
       - *start_ab
-      - *members_ok
-      - input: { act: { by: bob, wait: "Pending.others[B]@a2", outcome: approve, data: {} } }
+      - *primary_members_ok
+      - *others_members_b_ok
+      - input: { act: { by: bob, wait: "Pending.others.decision[B]@a2", outcome: approve, data: {} } }
         expect:
-          - [WaitCompleted, { wait: "Pending.others[B]@a2", outcome: approve, by: bob, evidence: { memberOf: [grp-b] } }]
-      - input: { act: { by: alice, wait: Pending.primary@a2, outcome: approve, data: { engLead: lee } } }
+          - [WaitCompleted, { wait: "Pending.others.decision[B]@a2", outcome: approve, by: bob, evidence: { memberOf: [grp-b] } }]
+      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
         expect:
-          - [WaitCompleted, { wait: Pending.primary@a2, outcome: approve, by: alice, evidence: { memberOf: [grp-a] } }]
+          - [WaitCompleted, { wait: Pending.primary.decision@a2, outcome: approve, by: alice, evidence: { memberOf: [grp-a] } }]
           - [TransitionFired, { transition: t_accept, activation: a2 }]
-          - [DataSet, { source: transition, patch: { engLead: lee } }]
+          - [DataSet, { source: transition, element: t_accept, patch: { engLead: lee } }]
           - [StageExited, { activation: a2, mode: normal }]
           - [StageEntered, { activation: a3, stage: InDevelopment, parentActivation: a1 }]
-          - [WaitOpened, { wait: InDevelopment.release@a3, kind: person, role: obligation, assignees: ["user:lee"] }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a3, kind: person, role: obligation, assignees: ["user:lee"] }]
         notify: [n_task]
-      - input: { act: { by: lee, wait: InDevelopment.release@a3, outcome: released, data: {} } }
+      - input: { act: { by: lee, wait: InDevelopment.release.task@a3, outcome: released, data: {} } }
         expect:
-          - [WaitCompleted, { wait: InDevelopment.release@a3, outcome: released, by: lee }]
+          - [WaitCompleted, { wait: InDevelopment.release.task@a3, outcome: released, by: lee }]
           - [TransitionFired, { transition: t_release, activation: a3 }]
           - [StageExited, { activation: a3, mode: normal }]
           - [StageEntered, { activation: a4, stage: Released, parentActivation: a1 }]
@@ -85,51 +109,43 @@ cases:
           - [DataSet, { source: start }]
           - [StageEntered, { activation: a1, stage: root }]
           - [StageEntered, { activation: a2, stage: Pending }]
-          - [WaitOpened, { wait: Pending.members@a2, args: { groups: [grp-a] } }]
-          - [WaitOpened, { wait: Pending.primary@a2 }]
-      - input: { act: { by: alice, wait: Pending.primary@a2, outcome: approve, data: { engLead: lee } } }
+          - [WaitOpened, { wait: Pending.primary.members@a2, args: { groups: [grp-a] } }]
+          - [WaitOpened, { wait: Pending.primary.decision@a2 }]
+          - [WaitOpened, { wait: Pending.others.members@a2, args: { groups: [] } }]   # opened even for an empty list; no others.decision waits
+      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
         expect:
-          - [WaitCompleted, { wait: Pending.primary@a2, outcome: approve, by: alice }]
+          - [WaitCompleted, { wait: Pending.primary.decision@a2, outcome: approve, by: alice }]
           - [TransitionFired, { transition: t_accept, activation: a2 }]
           - [DataSet, { source: transition, patch: { engLead: lee } }]
-          - [WaitCancelled, { wait: Pending.members@a2, cause: stage exit }]   # the directory call was still in flight
+          - [WaitCancelled, { wait: Pending.primary.members@a2, cause: stage exit }]   # both directory calls were still in flight
+          - [WaitCancelled, { wait: Pending.others.members@a2, cause: stage exit }]
           - [StageExited, { activation: a2, mode: normal }]
           - [StageEntered, { activation: a3, stage: InDevelopment }]
-          - [WaitOpened, { wait: InDevelopment.release@a3 }]
-      - input: { callResult: { wait: Pending.members@a2, outcome: ok, data: { groups: [{ id: grp-a, members: [alice, rita] }] } } }
+          - [WaitOpened, { wait: InDevelopment.release.task@a3 }]
+      - input: { callResult: { wait: Pending.primary.members@a2, outcome: ok, data: *members_a } }
         expect:
-          - [CallResultLate, { wait: Pending.members@a2, outcome: ok }]
-        notify: []          # a late result does not trigger the no-approver rule
+          - [CallResultLate, { wait: Pending.primary.members@a2, outcome: ok }]
+        notify: []          # a late result does not trigger a no-approver rule
 
   - id: T3
     name: A domain has no eligible approver; the request is submitted and waits
     turns:
-      - input: { start: { by: rita, input: { title: "New dashboard", primaryDomain: A, otherDomains: [C] } } }
-        expect:
-          - [RequestStarted, { by: rita }]
-          - [DataSet, { source: start }]
-          - [StageEntered, { activation: a1, stage: root }]
-          - [StageEntered, { activation: a2, stage: Pending }]
-          - [WaitOpened, { wait: Pending.members@a2, args: { groups: [grp-a, grp-c] } }]
-          - [WaitOpened, { wait: Pending.primary@a2 }]
-          - [WaitOpened, { wait: "Pending.others[C]@a2", assignees: ["group:grp-c"] }]
-      - input: { callResult: { wait: Pending.members@a2, outcome: ok, data: *members_ac } }
-        expect:
-          - [WaitCompleted, { wait: Pending.members@a2, outcome: ok }]
-        notify: [n_no_approver]
-    finalState: { activeStages: [root, Pending], open: [Pending.primary@a2, "Pending.others[C]@a2"], faulted: false }
+      - *start_ac
+      - *primary_members_ok
+      - *others_members_c_ok
+    finalState: { activeStages: [root, Pending], open: [Pending.primary.decision@a2, "Pending.others.decision[C]@a2"], faulted: false }
 
   - id: T4
     name: Refused attempts write nothing to history
     turns:
       - *start_ab
-      - input: { act: { by: rita, wait: Pending.primary@a2, outcome: approve, data: { engLead: lee } } }
+      - input: { act: { by: rita, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
         refuse: { reason: may }              # rita is in grp-a but is the requester
         expect: []
-      - input: { act: { by: bob, wait: Pending.primary@a2, outcome: approve, data: { engLead: lee } } }
+      - input: { act: { by: bob, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
         refuse: { reason: not-assignee }     # bob is not in grp-a
         expect: []
-      - input: { act: { by: alice, wait: Pending.primary@a2, outcome: approve, data: {} } }
+      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: {} } }
         refuse: { reason: invalid-data }     # engLead is required to approve
         expect: []
 
@@ -137,61 +153,60 @@ cases:
     name: One rejection rejects the request and cancels the approvals still open
     turns:
       - *start_ab
-      - *members_ok
-      - input: { act: { by: bob, wait: "Pending.others[B]@a2", outcome: reject, data: { reason: "Out of scope" } } }
+      - *primary_members_ok
+      - *others_members_b_ok
+      - input: { act: { by: bob, wait: "Pending.others.decision[B]@a2", outcome: reject, data: { reason: "Out of scope" } } }
         expect:
-          - [WaitCompleted, { wait: "Pending.others[B]@a2", outcome: reject, by: bob }]
+          - [WaitCompleted, { wait: "Pending.others.decision[B]@a2", outcome: reject, by: bob }]
           - [TransitionFired, { transition: t_reject, activation: a2 }]
-          - [WaitCancelled, { wait: Pending.primary@a2, cause: stage exit }]
+          - [WaitCancelled, { wait: Pending.primary.decision@a2, cause: stage exit }]
           - [StageExited, { activation: a2, mode: normal }]
           - [StageEntered, { activation: a3, stage: Rejected, parentActivation: a1 }]
           - [RequestClosed, { stage: Rejected }]
-      - input: { act: { by: alice, wait: Pending.primary@a2, outcome: approve, data: { engLead: lee } } }
+      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
         refuse: { reason: wait-not-open }
         expect: []
 
   - id: T6
     name: Admin skips a domain's approval and jumps, in one turn
     turns:
-      - input: { start: { by: rita, input: { title: "New dashboard", primaryDomain: A, otherDomains: [C] } } }
-        expect: same-as T3 turn 1
-      - input: { callResult: { wait: Pending.members@a2, outcome: ok, data: *members_ac } }
+      - *start_ac
+      - *primary_members_ok
+      - *others_members_c_ok
+      - input: { act: { by: alice, wait: Pending.primary.decision@a2, outcome: approve, data: { engLead: lee } } }
         expect:
-          - [WaitCompleted, { wait: Pending.members@a2, outcome: ok }]
-      - input: { act: { by: alice, wait: Pending.primary@a2, outcome: approve, data: { engLead: lee } } }
-        expect:
-          - [WaitCompleted, { wait: Pending.primary@a2, outcome: approve, by: alice }]   # t_accept is false: others[C] is open
+          - [WaitCompleted, { wait: Pending.primary.decision@a2, outcome: approve, by: alice }]   # t_accept is false: others.decision[C] is open
       - input:
           admin:
             by: root-admin
             reason: "Domain C has no approvers; approved out of band, ticket OPS-1"
             actions:
-              - { skip: "Pending.others[C]@a2" }
+              - { skip: "Pending.others.decision[C]@a2" }
               - { setData: { engLead: lee } }
               - { jump: { from: Pending, to: InDevelopment } }
             waived: []
         expect:
           - [Overridden, { by: root-admin }]
-          - [WaitSkipped, { wait: "Pending.others[C]@a2" }]
+          - [WaitSkipped, { wait: "Pending.others.decision[C]@a2" }]
           - [DataSet, { source: admin, patch: { engLead: lee } }]
           - [StageExited, { activation: a2, mode: forced }]
           - [StageEntered, { activation: a3, stage: InDevelopment, parentActivation: a1 }]
-          - [WaitOpened, { wait: InDevelopment.release@a3, assignees: ["user:lee"] }]
+          - [WaitOpened, { wait: InDevelopment.release.task@a3, assignees: ["user:lee"] }]
 
   - id: T6b
     name: A skip alone decides nothing and leaves the request stuck
     turns:
-      - same-as: T6 turns 1 to 3
+      - same-as: T6 turns 1 to 4
       - input:
-          admin: { by: root-admin, reason: "Domain C has no approvers", actions: [ { skip: "Pending.others[C]@a2" } ], waived: [] }
+          admin: { by: root-admin, reason: "Domain C has no approvers", actions: [ { skip: "Pending.others.decision[C]@a2" } ], waived: [] }
         expect:
           - [Overridden, { by: root-admin }]
-          - [WaitSkipped, { wait: "Pending.others[C]@a2" }]
+          - [WaitSkipped, { wait: "Pending.others.decision[C]@a2" }]
           - [Faulted, { kind: stuck }]       # t_accept stays false; no obligation or call is open
     finalState: { activeStages: [root, Pending], open: [], faulted: true }
 
   - id: T7
-    name: Admin jumps while the directory call is in flight
+    name: Admin jumps while the directory calls are in flight
     turns:
       - *start_ab
       - input:
@@ -205,15 +220,16 @@ cases:
         expect:
           - [Overridden, { by: root-admin }]
           - [DataSet, { source: admin, patch: { engLead: lee } }]
-          - [WaitSkipped, { wait: Pending.members@a2 }]
-          - [WaitSkipped, { wait: Pending.primary@a2 }]
-          - [WaitSkipped, { wait: "Pending.others[B]@a2" }]
+          - [WaitSkipped, { wait: Pending.primary.members@a2 }]
+          - [WaitSkipped, { wait: Pending.primary.decision@a2 }]
+          - [WaitSkipped, { wait: Pending.others.members@a2 }]
+          - [WaitSkipped, { wait: "Pending.others.decision[B]@a2" }]
           - [StageExited, { activation: a2, mode: forced }]
           - [StageEntered, { activation: a3, stage: InDevelopment, parentActivation: a1 }]
-          - [WaitOpened, { wait: InDevelopment.release@a3 }]
-      - input: { callResult: { wait: Pending.members@a2, outcome: ok, data: *members_ab } }
+          - [WaitOpened, { wait: InDevelopment.release.task@a3 }]
+      - input: { callResult: { wait: Pending.primary.members@a2, outcome: ok, data: *members_a } }
         expect:
-          - [CallResultLate, { wait: Pending.members@a2, outcome: ok }]
+          - [CallResultLate, { wait: Pending.primary.members@a2, outcome: ok }]
 
   - id: T7b
     name: A jump without the data the target stage requires is refused
@@ -230,7 +246,7 @@ cases:
       - input: { start: { by: rita, input: { title: "Typo domain", primaryDomain: Z, otherDomains: [] } } }
         expect:
           - [RequestStarted, { by: rita }]
-          - [Faulted, { kind: error, element: Pending.members }]    # approverGroup has no key Z
+          - [Faulted, { kind: error, element: primary.members }]    # approverGroup has no key Z
       - input:
           admin: { by: root-admin, reason: "Unknown domain; requester to resubmit", actions: [ { close: {} } ], waived: [] }
         expect:
