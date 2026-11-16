@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
 
-rm *.txt
+rm -f *.md *.txt *.json
 
 my_dir="$(pwd)"
 
-for f in workflow-system workflow-system-v1; do
-    claude_dir="$(wslpath 'C:\Users\HauHau\Claude\'"$f")"
-    pushd "$claude_dir"
+for folder in workflow workflow-system-v1; do
+    claude_dir="$(wslpath 'C:\Users\HauHau\Claude\'"$folder")"
+    pushd "$claude_dir" > /dev/null || continue
+    outfile="$my_dir/$folder.json"
 
-    git ls-files | grep -vPie '^(?:\.git|\.claude)|(?:\.ps1|\.png|\.ico)$' \
-    | while read f; do
-        echo "===\n$f\n==="
-        cat "$f"
-    done >"$my_dir/$f.txt"
+    echo "{" > "$outfile"
+    first=true
 
-    popd
+    # -z outputs null-delimited paths to safely handle spaces or special characters
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        [ "$first" = true ] && first=false || echo "," >> "$outfile"
+
+        b64=$(base64 -w 0 "$f")
+        # Use "$f" directly instead of "$(basename "$f")" to keep the relative folder path
+        printf '  "%s": "%s"' "$f" "$b64" >> "$outfile"
+    done < <(git ls-files | grep -vPie '^(?:\.git|\.claude)|(?:\.ps1)$')
+
+    echo -e "\n}" >> "$outfile"
+    echo "Packed into $outfile"
+
+    popd > /dev/null
 done
