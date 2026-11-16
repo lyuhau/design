@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 
-rm design.md
+rm *.txt
 
-claude_dir="$(wslpath 'C:\Users\HauHau\Claude\workflow-platform')"
-pushd "$claude_dir"
-git ls-files | grep -vPie '^(?:\.git|\.claude)|(?:\.ps1)$' \
-| while read f; do
-	echo "===\n$f\n==="
-	cat "$f"
-done >design.md
-popd
+my_dir="$(pwd)"
 
-mv "$claude_dir/design.md" .
+for f in workflow-system workflow-system-v1; do
+    claude_dir="$(wslpath 'C:\Users\HauHau\Claude\'"$f")"
+    pushd "$claude_dir"
 
+    git ls-files | grep -vPie '^(?:\.git|\.claude)|(?:\.ps1|\.png|\.ico)$' \
+    | while read f; do
+        echo "===\n$f\n==="
+        cat "$f"
+    done >"$my_dir/$f.txt"
+
+    popd
+done
