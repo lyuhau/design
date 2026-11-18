@@ -4,7 +4,7 @@ rm -f *.md *.txt *.json
 
 my_dir="$(pwd)"
 
-for folder in workflow workflow-system-v1; do
+for folder in "workflow-system"; do
     claude_dir="$(wslpath 'C:\Users\HauHau\Claude\'"$folder")"
     pushd "$claude_dir" > /dev/null || continue
     outfile="$my_dir/$folder.json"
@@ -20,7 +20,7 @@ for folder in workflow workflow-system-v1; do
         b64=$(base64 -w 0 "$f")
         # Use "$f" directly instead of "$(basename "$f")" to keep the relative folder path
         printf '  "%s": "%s"' "$f" "$b64" >> "$outfile"
-    done < <(git ls-files | grep -vPie '^(?:\.git|\.claude)|(?:\.ps1)$')
+    done < <(git ls-files | grep -vPie '^(?:\.git|\.claude)|\.(?:ps1|png)$')
 
     echo -e "\n}" >> "$outfile"
     echo "Packed into $outfile"
