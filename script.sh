@@ -4,7 +4,7 @@ rm -f *.md *.txt *.json
 
 my_dir="$(pwd)"
 
-for folder in workflow workflow-system-v1; do
+for folder in workflow-system; do
     claude_dir="$(wslpath 'C:\Users\HauHau\Claude\'"$folder")"
     pushd "$claude_dir" > /dev/null || continue
     outfile="$my_dir/$folder.json"
